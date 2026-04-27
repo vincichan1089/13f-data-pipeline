@@ -1,128 +1,117 @@
-# SEC 13F Institutional Holdings — Data Pipeline
+# SEC 13F Institutional Holdings Data Pipeline
 
-An end-to-end data pipeline for downloading, parsing, and analyzing SEC Form 13F institutional holdings filings using R and Quarto.
+An end-to-end R and Quarto pipeline for downloading, extracting, parsing, cleaning, and analyzing SEC 13F institutional holdings filings.
 
-The SEC Form 13F requires institutional investment managers with over $100 million in qualifying assets to report their quarterly equity holdings. This project builds a reproducible pipeline to collect, clean, and analyze the full universe of 13F filings from 1993 to present.
-
----
+This project builds a historical 13F holdings dataset from raw SEC EDGAR filings. It automates the workflow from quarterly filing download through table extraction and parsing to cleaned manager-quarter holdings panels for downstream research and analysis.
 
 ## Overview
 
-This pipeline automates the full 13F data workflow:
+The pipeline is designed to turn raw 13F filings into structured, analysis-ready holdings data. It handles multiple filing and table formats across time, stores intermediate outputs in SQLite and Parquet, and includes quality-assurance checks at each major stage.
 
-1. **Download** — Fetches raw XML filings from the SEC EDGAR database
-2. **Extract** — Parses holdings data from individual filing XMLs
-3. **Parse** — Standardizes and structures holdings into tidy formats
-4. **Combine** — Merges quarterly data into a unified panel
-5. **Clean** — Performs data quality checks and corrections
-6. **Analyze** — Generates summary statistics and visualizations
+## Pipeline Stages
 
-The pipeline covers approximately **30+ years** of 13F filings (1993–2026), processed through a parallelized, modular architecture.
+1. **Download filings**
+   - Pull quarterly SEC master index files
+   - Filter for 13F-related submissions
+   - Download raw filing text files from EDGAR
 
----
+2. **Recover missing filings**
+   - Compare downloaded filings against the master index
+   - Redownload and append missing files to the quarter database
 
-## Pipeline Structure
+3. **Build CUSIP universe**
+   - Download and parse SEC 13F CUSIP reference lists
+   - Handle pre-2004 PDF/OCR quirks and post-2004 table formats
+   - Store quarter-level CUSIP lists for downstream matching
 
+4. **Extract holdings tables**
+   - Extract information tables from raw filings
+   - Support XML sections, `TABLE` blocks, and fallback text extraction logic
+   - Save raw extracted holdings text for each filing
+
+5. **Parse holdings**
+   - Parse XML, tab-delimited, comma-delimited, and fixed-width style tables
+   - Identify CUSIPs, values, share counts, discretion flags, and related fields
+   - Write structured holdings rows back to quarterly SQLite files
+
+6. **Combine quarterly outputs**
+   - Read parsed holdings across quarter-level databases
+   - Append into a unified historical holdings dataset
+   - Export consolidated data to Parquet
+
+7. **Clean and standardize**
+   - Standardize reporting and filing dates
+   - Select canonical filings for each manager-quarter
+   - Clean and validate CUSIPs
+   - Filter extreme outliers
+   - Detect likely post-2023 value unit switches
+   - Fill missing quarters to build a more complete panel
+
+8. **Analyze**
+   - Construct manager-quarter portfolio summaries
+   - Compute simple return and holdings-based metrics
+   - Explore cross-sectional fund characteristics
+
+## Repository Structure
+
+```text
+01_download.qmd                  # Download quarterly 13F filings from SEC EDGAR
+01a_redownload_missing_files.qmd # Identify and recover missing filings
+01b_cusip_universe.qmd           # Build quarterly 13F CUSIP universe
+02_extract.qmd                   # Extract raw holdings tables from filings
+03_parse.qmd                     # Parse extracted tables into structured holdings
+04_combine.qmd                   # Combine parsed quarterly outputs
+05_clean.qmd                     # Clean, standardize, and panelize holdings data
+06_analysis.qmd                  # Exploratory analysis on cleaned holdings data
+
+config.R                         # Project configuration and directory settings
+utils_db.R                       # Database path / connection helpers
+utils_cusip.R                    # Quarter-aware CUSIP lookup helpers
+utils_dates.R                    # Quarter table and date utilities
 ```
-workspace/
-├── R/                          # Shared utility functions
-│   ├── config.R                # Project configuration (years, paths, settings)
-│   ├── utils_cusip.R           # CUSIP lookup and mapping utilities
-│   ├── utils_dates.R           # Date parsing and quarter handling
-│   └── utils_db.R              # SQLite database read/write utilities
-│
-├── qmd/                        # Quarto documents (pipeline stages)
-│   ├── 01_download.qmd         # Download filings from SEC EDGAR
-│   ├── 01a_redownload_missing_files.qmd  # Retry failed downloads
-│   ├── 01b_cusip_universe.qmd  # Build CUSIP-to-ticker mapping universe
-│   ├── 02_extract.qmd          # Extract holdings from raw XML
-│   ├── 03_parse.qmd            # Parse and standardize data
-│   ├── 04_combine.qmd          # Combine quarterly datasets
-│   ├── 05_clean.qmd            # Data cleaning and QA
-│   └── 06_analysis.qmd         # Exploratory analysis and outputs
-│
-└── .gitignore
-```
-
----
 
 ## Tech Stack
 
-| Category      | Tools |
-|--------------|-------|
-| Language     | R |
-| Reporting    | Quarto (HTML output) |
-| Data         | `data.table`, `dplyr`, `lubridate` |
-| Database     | `DBI`, `RSQLite` |
-| Parallel     | `future`, `furrr` |
-| Project Mgmt | `here` |
-
----
+- **R**
+- **Quarto**
+- **SQLite**
+- **Arrow / Parquet**
+- **tidyverse**
+- **future / furrr** for parallel processing
 
 ## Key Features
 
-- **Parallelized downloads** using `future`/`furrr` with configurable worker count
-- **CUSIP-to-ticker mapping** for cross-referencing holdings with market data
-- **SQLite-backed storage** for efficient querying of large panel datasets
-- **Modular pipeline design** — each stage is a self-contained Quarto document
-- **SEC-compliant** — respects EDGAR rate limits via user agent identification
-- **Reproducible** — fully scripted workflow from raw data to analysis outputs
+- End-to-end historical 13F data pipeline
+- Support for multiple filing and table formats across filing eras
+- Quarter-specific CUSIP reference matching
+- SQLite-backed intermediate storage
+- Parquet outputs for efficient downstream analysis
+- Built-in QA summaries and validation plots
+- Modular workflow split into reproducible Quarto scripts
 
----
+## Data Workflow
 
-## Usage
+Raw SEC filings are downloaded and stored quarter by quarter. Holdings tables are then extracted and parsed into structured rows, combined into a full historical dataset, and cleaned into a manager-quarter panel for research use.
 
-### Clone the repository
+Intermediate processing relies on SQLite databases, while downstream combined and cleaned datasets are written in Parquet format for efficient analysis.
 
-```bash
-git clone https://github.com/VinciChan2233/workspace.git
-cd workspace
-```
+## Example Use Cases
 
-### Install required R packages
+This repository can support work such as:
+- Institutional holdings research
+- Manager-level portfolio analysis
+- Historical 13F panel construction
+- Data engineering practice with messy regulatory filings
+- Reproducible finance and market microdata workflows
 
-```r
-install.packages(c("here", "data.table", "dplyr", "lubridate",
-                   "DBI", "RSQLite", "future", "furrr"))
-```
+## Notes
 
-### Run the pipeline
-
-Open the Quarto documents in RStudio and knit each file in sequence (01 → 06), or source the R scripts individually.
-
-1. Configure parameters in `R/config.R` (year range, parallel workers, etc.)
-2. Run `01_download.qmd` to fetch filings from SEC EDGAR
-3. Proceed through stages 02–06 in order
-
-> **Note:** The download stage makes HTTP requests to the SEC EDGAR API. Please be respectful of their rate limits.
-
----
-
-## Data Source
-
-- **SEC EDGAR**: U.S. Securities and Exchange Commission Electronic Data Gathering, Analysis, and Retrieval system
-- **Form 13F**: Institutional Investment Manager Holdings Report
-- **Coverage**: 1993–2026 (full historical archive)
-
----
-
-## Potential Use Cases
-
-- Track institutional ownership trends across sectors and market caps
-- Identify "smart money" flows and manager concentration
-- Analyze portfolio construction patterns of top asset managers
-- Build factor or style exposure datasets from institutional holdings
-- Research market structure and the evolution of institutional investing
-
----
+- The pipeline includes special handling for historical filing inconsistencies and missing quarters.
+- Some stages include quarter-level QA outputs and manual exception handling where SEC source files are irregular.
+- The repository is an active research/data engineering project and may continue to evolve.
 
 ## Author
 
 **Vinci Chan**
 
-- GitHub: [VinciChan2233](https://github.com/VinciChan2233)
-- Location: Hong Kong
-
----
-
-*This project is for educational and analytical purposes. Data is sourced from publicly available SEC filings.*
+If you work in finance, data analytics, or regulatory filings research, feel free to connect via LinkedIn or explore the repository.
