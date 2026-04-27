@@ -1,0 +1,690 @@
+---
+title: "05_clean"
+author: "Vinci Chan"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc_expand: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 1. Setup
+
+```{r}
+library(tidyverse)
+library(arrow)
+library(future)
+library(furrr)
+
+source("R/config.R")
+source("R/utils_dates.R")
+
+plan(multisession)
+
+rquarters <- make_quarter_tbl(
+  start_year = cfg$start_year,
+  end_year = 2025,
+  start_month_day = "0101",
+  end_month_day = "1231"
+) %>% 
+mutate(
+  rquarter = floor_date(date, "quarter") + months(3) - days(1)
+  ) %>% 
+filter(rquarter >= ymd(19990101)) %>% 
+distinct(rquarter) %>% 
+arrange(rquarter)
+
+qa_dir_05 <- file.path(cfg$qa_dir, "05")
+dir.create(qa_dir_05, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 2. Functions
+
+## 2.1. Extract rows and columns
+
+```{r}
+build_holdext_raw <- function() {
+  all_path <- file.path(cfg$derived_dir, "all_holdings.parquet")
+  extract_path <- file.path(cfg$derived_dir, "holdext_raw_parquet")
+
+  if(!file.exists(extract_path)) {
+    open_dataset(all_path) %>% 
+    # Drop rows that are completely empty on key holding fields
+    filter(
+      !(
+        is.na(nameOfIssuer) &
+        is.na(titleOfClass) &
+        is.na(cusip) &
+        is.na(value) &
+        is.na(shrsOrPrnAmt) &
+        is.na(investmentDiscretion) &
+        is.na(votingAuthority) &
+        is.na(shares)
+      )
+    ) %>% 
+    # Select only relevant rows
+    select(
+      filename, cik, cikname,
+      rdate, fdate, nameOfIssuer,
+      cusip, value, shares
+    ) %>% 
+    # Write holdext_raw
+    write_dataset(
+      extract_path,
+      format = "parquet"
+    )
+  }
+  open_dataset(extract_path) %>% 
+    mutate(filename = cast(filename, string()))
+}
+```
+
+## 2.2. Data Cleaning
+
+### 2.2.1 rdate
+
+We first clean and standardise the reporting and filing dates. `rdate` and `fdate` are converted from Unix time to calendar dates, obvious data‐entry errors in `rdate` are corrected manually, and all reports are mapped to canonical quarter‑end dates (`rquarter`) to simplify building manager-quarter panels and computing returns. To focus on the post‑EDGAR regime, we then drop all pre‑1999 reporting quarters.
+
+```{r}
+clean_dates <- function(holdext_raw) {
+  # Change rdate and fdate class from Unix time to date
+  holdext_raw <- holdext_raw %>% 
+    mutate(
+      rdate = as_date(rdate),
+      fdate = as_date(fdate)
+    )
+
+  # Check for weird rdates
+  weird_rdates <- holdext_raw %>% 
+    to_duckdb() %>% 
+    filter(rdate > fdate) %>% 
+    select(filename, rdate, fdate) %>% 
+    distinct(filename, .keep_all = TRUE) %>% 
+    collect()
+
+  holdext_raw <- holdext_raw %>% 
+    mutate(
+      # Fix weird dates manually
+      rdate = case_when(
+        filename == "0000080255-03-000400.txt" ~ as_date("2002-12-31"),
+        filename == "0000905148-07-001531.txt" ~ as_date("2006-09-30"),
+        filename == "0001103882-11-000001.txt" ~ as_date("2010-09-30"),
+        TRUE ~ rdate
+      ),
+      # for filings with rdate == fdate, assume rdate to be the previous quarter end
+      same_date = rdate == fdate,
+      rdate = if_else(
+        same_date,
+        as_date(floor_date(fdate, unit = "quarter") - ddays(1)),
+        rdate
+      )
+    ) %>%
+    select(-same_date)
+
+  # Standardise to rquarter and handle rdate == fdate
+  rquarter_build <- holdext_raw %>% 
+    distinct(rdate) %>% 
+    collect() %>% 
+    mutate(
+      rquarter = floor_date(rdate, "quarter") + months(3) - days(1)
+    )
+
+  holdext_raw %>% 
+    left_join(rquarter_build, by = "rdate") %>%
+    relocate(rquarter, .after = rdate) %>%
+    # Remove pre-1999 rquarters
+    filter(rquarter >= ymd(19990101))
+}
+```
+
+Weird `rdate`:
+[0000080255-03-000400.txt](https://www.sec.gov/Archives/edgar/data/80255/0000080255-03-000400.txt)
+[0000905148-07-001531.txt](https://www.sec.gov/Archives/edgar/data/1352851/0000905148-07-001531.txt)
+[0001103882-11-000001.txt](https://www.sec.gov/Archives/edgar/data/1352910/0001103882-11-000001.txt)
+
+### 2.2.2. fdate
+
+Some rdates map to the same rquarter (quarter-end bucket), with multiple filings per manager-quarter. Some subsequent filings restate the complete, updated portfolio, while some are small additions that do not represent the full portfolio.
+
+To obtain a single canonical portfolio per manager-quarter, for each `cik` + `rquarter` we first identify the filing(s) with the maximum number of holdings (n_holdings), as these are most likely to be full portfolio snapshots. If several filings have the same maximum n_holdings, we then select the one with the latest fdate as the final version for that reporting period. All non‑selected filings are dropped.
+
+```{r}
+select_canonical_filings <- function(holdext_raw) {
+  canonical <- holdext_raw %>% 
+  to_duckdb() %>% 
+  group_by(cik, rquarter, filename) %>% 
+  summarise(
+    n_holdings = n(),
+    fdate = max(fdate),
+    .groups = "drop"
+  ) %>% 
+  group_by(cik, rquarter) %>% 
+  filter(n_holdings == max(n_holdings)) %>% 
+  slice_max(fdate, n = 1, with_ties = FALSE) %>% 
+  ungroup() %>% 
+  select(cik, rquarter, filename) %>% 
+  collect()
+
+  holdext_raw %>% 
+    semi_join(canonical, by = join_by(cik, rquarter, filename))
+}
+```
+
+### 2.2.3. cusip 
+
+A few thousand of rows has cusips shorter than 7 characters. Those will be dropped.
+
+```{r}
+clean_cusip <- function(holdext_raw) {
+  holdext_raw %>% 
+    mutate(
+      cusip = toupper(str_trim(cusip)),
+      cusip_len = nchar(cusip)
+    ) %>% 
+    filter(cusip_len >= 7) %>% 
+    select(-cusip_len)
+}
+```
+
+There a few thousand rows with cusip as "000000000". They are kept for now.
+
+### 2.2.4. value and shares outliers
+
+```{r}
+filter_outliers <- function(holdext_raw) {  
+  caps <- holdext_raw %>%
+    to_duckdb() %>% 
+    summarise(
+      value_cap = quantile(value, 0.999, na.rm = TRUE),
+      shares_cap = quantile(shares, 0.999, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    collect()
+
+  holdext_raw %>%
+    filter(
+      (is.na(value) | value <= caps$value_cap) & 
+      (is.na(shares) | shares <= caps$shares_cap)
+    )
+}
+```
+
+### 2.2.5. value unit conversion
+
+Starting on January 3, 2023, market value is reported in dollars. Previously, market value was reported in thousands. [SEC Notice](https://www.sec.gov/files/form_13f_readme.pdf)
+
+To preserve consistency over time, values reported in dollars should be converted back to thousands. However, not all filers appear to switch units at the same time, so we detect likely unit-switch episodes from manager-level quarter-on-quarter jumps in aggregate portfolio value rather than applying a blanket conversion rule.
+
+```{r}
+detect_unit_switches <- function(holdext_raw) {
+  conversion_date <- ymd(20230103)
+
+  # 1. Create manager–quarter value panel
+  value_panel <- holdext_raw %>% 
+    to_duckdb() %>% 
+    group_by(cik, rquarter) %>% 
+    summarise(
+      fdate           = max(fdate, na.rm = TRUE),
+      portfolio_value = sum(value,  na.rm = TRUE),
+      holdings_count  = n(),
+      total_shares    = sum(shares, na.rm = TRUE),
+      .groups         = "drop"
+    ) %>% 
+    collect() %>% 
+    arrange(cik, rquarter) %>% 
+    group_by(cik) %>% 
+    mutate(
+      lag_value          = lag(portfolio_value),
+      lag_holdings_count = lag(holdings_count),
+      lag_total_shares   = lag(total_shares),
+
+      value_qoq_ratio = if_else(
+        portfolio_value > 0 & lag_value > 0,
+        portfolio_value / lag_value,
+        NA_real_
+      ),
+      holdings_qoq_ratio = if_else(
+        holdings_count > 0 & lag_holdings_count > 0,
+        holdings_count / lag_holdings_count,
+        NA_real_
+      ),
+      shares_qoq_ratio = if_else(
+        total_shares > 0 & lag_total_shares > 0,
+        total_shares / lag_total_shares,
+        NA_real_
+      ),
+      lead_value_qoq_ratio = lead(value_qoq_ratio),
+      min_rquarter_per_cik = min(rquarter, na.rm = TRUE)
+    ) %>% 
+    ungroup()
+
+  # 2. Calibrate thresholds using pre‑2023 data
+  # Start with very loose provisional mins so we can measure the distribution
+  qoq_pre2023_raw <- value_panel %>%
+    filter(fdate < conversion_date)
+
+  # Helper for levels
+  calibrate_level <- function(df, var) {
+    df %>%
+      transmute(x = {{ var }}) %>%
+      filter(!is.na(x), is.finite(x), x > 0) %>%
+      summarise(
+        p01  = quantile(x, 0.01,  na.rm = TRUE),
+        p05  = quantile(x, 0.05,  na.rm = TRUE),
+        p10  = quantile(x, 0.10,  na.rm = TRUE),
+        med  = median(x, na.rm = TRUE),
+        .groups = "drop"
+      )
+  }
+
+  level_value_calibration    <- calibrate_level(qoq_pre2023_raw, portfolio_value)
+  level_holdings_calibration <- calibrate_level(qoq_pre2023_raw, holdings_count)
+
+  # Data‑driven minimums: e.g. 1st percentile for value and 5th percentile for holdings
+  min_portfolio_value <- as.numeric(level_value_calibration$p01)
+  min_holdings_count  <- as.numeric(level_holdings_calibration$p05)
+
+  # Now filter using these calibrated mins
+  qoq_pre2023 <- value_panel %>%
+    filter(
+      fdate < conversion_date,
+      portfolio_value    >= min_portfolio_value,
+      lag_value          >= min_portfolio_value,
+      holdings_count     >= min_holdings_count,
+      lag_holdings_count >= min_holdings_count
+    )
+
+  # Ratio calibration helper (unchanged)
+  calibrate_ratio <- function(df, var) {
+    df %>%
+      transmute(x = {{ var }}) %>%
+      filter(!is.na(x), is.finite(x), x > 0) %>%
+      summarise(
+        p99   = quantile(x, 0.99,  na.rm = TRUE),
+        p995  = quantile(x, 0.995, na.rm = TRUE),
+        p999  = quantile(x, 0.999, na.rm = TRUE),
+        max_x = max(x, na.rm = TRUE),
+        .groups = "drop"
+      )
+  }
+
+  value_calibration    <- calibrate_ratio(qoq_pre2023, value_qoq_ratio)
+  holdings_calibration <- calibrate_ratio(qoq_pre2023, holdings_qoq_ratio)
+  shares_calibration   <- calibrate_ratio(qoq_pre2023, shares_qoq_ratio)
+
+  # Threshold for unit_conversions
+  jump_on_threshold  <- min(250, value_calibration$p995)
+  jump_off_threshold <- 1 / jump_on_threshold
+
+  # Post‑jump stabilisation (value ratios)
+  stable_lower <- 0.67
+  stable_upper <- 1.50
+
+  # Holdings and shares jump thresholds (ratio caps, data‑driven)
+  holdings_jump_upper <- min(5, holdings_calibration$p999)
+  shares_jump_upper   <- min(10, shares_calibration$p99 * 2)
+
+  # 3. Detect likely switch episodes
+  value_flags <- value_panel %>% 
+    filter(fdate >= conversion_date) %>% 
+    arrange(cik, rquarter) %>% 
+    group_by(cik) %>% 
+    mutate(
+      has_preconversion_data = min_rquarter_per_cik < conversion_date,
+
+      eligible_for_detection =
+        portfolio_value    >= min_portfolio_value &
+        lag_value          >= min_portfolio_value &
+        holdings_count     >= min_holdings_count &
+        lag_holdings_count >= min_holdings_count,
+
+      stable_next_qtr =
+        !is.na(lead_value_qoq_ratio) &
+        dplyr::between(lead_value_qoq_ratio, stable_lower, stable_upper),
+
+      holdings_stable =
+        !is.na(holdings_qoq_ratio) &
+        holdings_qoq_ratio <= holdings_jump_upper,
+
+      shares_stable =
+        !is.na(shares_qoq_ratio) &
+        shares_qoq_ratio <= shares_jump_upper,
+
+      switch_on_event =
+        !is.na(value_qoq_ratio) &
+        eligible_for_detection &
+        holdings_stable &
+        shares_stable &
+        value_qoq_ratio >= jump_on_threshold &
+        stable_next_qtr,
+
+      switch_off_event =
+        !is.na(value_qoq_ratio) &
+        eligible_for_detection &
+        holdings_stable &
+        shares_stable &
+        value_qoq_ratio <= jump_off_threshold,
+
+      event          = dplyr::case_when(
+        switch_on_event  ~ 1L,
+        switch_off_event ~ -1L,
+        TRUE             ~ 0L
+      ),
+      raw_episode     = cumsum(event),
+      active_episode  = pmax(raw_episode, 0L),
+      # Apply scaling: detected switch OR post-conversion-only fund
+      scale_down_flag = active_episode > 0 | !has_preconversion_data
+    ) %>% 
+    ungroup()
+
+  # 4. Apply scaling to full row‑level data
+  holdext_raw %>% 
+    left_join(
+      value_flags %>% 
+        select(cik, rquarter, scale_down_flag),
+      by = c("cik", "rquarter"),
+      copy = TRUE
+    ) %>% 
+    mutate(
+      scale_down_flag = if_else(is.na(scale_down_flag), FALSE, scale_down_flag),
+      value = if_else(scale_down_flag, value / 1000, value)
+    ) %>%
+    select(
+      filename, cik, cikname, rdate, rquarter, fdate,
+      nameOfIssuer, cusip, value, shares
+    )
+}
+```
+
+### 2.2.6. Missing quarters
+
+We build a complete cik-quarter panel with LOCF (last observation carried forward).
+
+```{r}
+build_missing_quarters_batch <- function(batch_ds) {
+  # Identify the columns that define a holding row
+  holding_cols <- c(
+    "nameOfIssuer",
+    "cusip",
+    "value",
+    "shares"
+  )
+
+  # 1. Load into memory
+  batch_df <- batch_ds %>% collect()
+
+  # 2. Complete grid
+  cik_ranges <- batch_df %>% 
+    distinct(cik, rquarter) %>% 
+    group_by(cik) %>% 
+    summarise(
+      min_rquarter = min(rquarter),
+      max_rquarter = max(rquarter),
+      .groups = "drop"
+    )
+  
+  cik_quarter_grid <- cik_ranges %>%
+    cross_join(rquarters) %>%
+    filter(
+      rquarter >= min_rquarter,
+      rquarter <= max_rquarter
+    ) %>%
+    select(cik, rquarter)
+
+  filled_holdext_rquarter <- cik_quarter_grid %>% 
+    left_join(batch_df, by = c("cik", "rquarter"))
+  
+  # 3. Flag missing vs non-operating quarters
+  filled_holdext_rquarter <- filled_holdext_rquarter %>%
+    mutate(
+      is_empty_row = if_all(all_of(holding_cols), ~ is.na(.x)),
+      missing_quarter = if_else(is_empty_row, 1L, 0L)
+    ) %>%
+    select(-is_empty_row)
+
+  # 4. Compute prior_rdate for every row
+  filled_with_prior <- filled_holdext_rquarter %>% 
+    arrange(cik, rquarter) %>% 
+    group_by(cik) %>% 
+    mutate(
+      own_rquarter = if_else(
+        missing_quarter == 0L,
+        rquarter,
+        as.Date(NA)
+      ),
+      prior_rquarter_num = cummax(coalesce(as.numeric(own_rquarter), -Inf)),
+      prior_rquarter = as_date(prior_rquarter_num)
+    ) %>% 
+    ungroup() %>% 
+    select(-own_rquarter, -prior_rquarter_num)
+
+  # 5. Build holdext_clean: keep real + non-OP rows, LOCF for missing
+  real_holdings <- filled_with_prior %>% 
+    filter(missing_quarter == 0L) %>% 
+    select(cik:shares)
+
+  core_cols <- colnames(real_holdings)
+
+  locf_rows <- filled_with_prior %>% 
+    filter(missing_quarter == 1L) %>% 
+    select(cik, rquarter, prior_rquarter) %>% 
+    left_join(
+      real_holdings %>% 
+        rename(prior_rquarter = rquarter),
+      by = c("cik", "prior_rquarter"),
+      relationship = "many-to-many"
+    ) %>% 
+    select(all_of(core_cols))
+
+  bind_rows(real_holdings, locf_rows)
+}
+```
+
+# 3. Orchestration
+
+```{r}
+# Stage 0
+stage0 <- build_holdext_raw()
+
+# Stage 1
+stage1 <- stage0 %>%
+  clean_dates() %>%
+  select_canonical_filings() %>%
+  clean_cusip() %>%
+  filter_outliers() %>%
+  detect_unit_switches()
+
+# Stage 2
+stage2_path <- file.path(cfg$staging_dir, "holdext_raw_stage2_parquet")
+if (dir.exists(stage2_path)) unlink(stage2_path, recursive = TRUE, force = TRUE)
+
+cik_batch <- stage1 %>%
+  distinct(cik) %>%
+  arrange(cik) %>%
+  collect() %>%
+  mutate(batch_id = sprintf("batch_%04d", ceiling(row_number() / 500)))
+
+stage1 %>%
+  left_join(cik_batch, by = "cik") %>%
+  write_dataset(
+    path = stage2_path,
+    format = "parquet",
+    partitioning = "batch_id"
+  )
+
+stage2 <- open_dataset(stage2_path)
+
+# Stage 3
+stage3_path <- file.path(cfg$derived_dir, "holdext_clean_parquet")
+if (dir.exists(stage3_path)) unlink(stage3_path, recursive = TRUE, force = TRUE)
+dir.create(stage3_path, recursive = TRUE)
+
+batch_ids <- cik_batch %>%
+  distinct(batch_id) %>%
+  arrange(batch_id) %>%
+  pull(batch_id)
+
+future_walk(batch_ids, function(b) {
+  batch_ds <- open_dataset(stage2_path) %>%
+    filter(batch_id == b) %>%
+    select(-batch_id)
+
+  holdext_clean_batch <- build_missing_quarters_batch(batch_ds)
+
+  write_parquet(
+    holdext_clean_batch,
+    sink = file.path(stage3_path, paste0(b, ".parquet")),
+    compression = "zstd"
+  )
+
+  rm(holdext_clean_batch)
+  gc()
+  
+  invisible(NULL)
+})
+
+holdext_clean <- open_dataset(stage3_path)
+```
+
+# 4. Check and clean up
+
+```{r}
+n_gaps <- holdext_clean %>%
+  distinct(cik, rquarter) %>%
+  collect() %>% 
+  arrange(cik, rquarter) %>%
+  group_by(cik) %>%
+  mutate(
+    expected_next = ceiling_date(rquarter, "month") %m+% months(3) - days(1),
+    actual_next   = lead(rquarter),
+    has_gap       = !is.na(actual_next) & actual_next != expected_next
+  ) %>%
+  ungroup() %>%
+  filter(has_gap) %>%
+  summarise(n_gap_rows = n()) %>%
+  pull(n_gap_rows)
+
+if(n_gaps == 0) {
+  unlink(stage2_path, recursive = TRUE, force = TRUE)
+}
+```
+
+# 5. QA
+
+```{r}
+holdext_raw   <- open_dataset(file.path(cfg$derived_dir,  "holdext_raw_parquet"))
+holdext_clean <- open_dataset(file.path(cfg$derived_dir,  "holdext_clean_parquet"))
+```
+
+```{r}
+quarter_cmp <- holdext_raw %>%
+  select(cik, rdate) %>%
+  collect() %>%
+  mutate(
+    rdate = as_date(rdate),
+    rquarter = floor_date(rdate, "quarter") + months(3) - days(1)
+  ) %>%
+  distinct(cik, rquarter) %>%
+  count(cik, name = "raw_n_q") %>%
+  full_join(
+    holdext_clean %>%
+      distinct(cik, rquarter) %>%
+      collect() %>%
+      count(cik, name = "clean_n_q"),
+    by = "cik"
+  ) %>%
+  mutate(
+    raw_n_q   = replace_na(raw_n_q, 0L),
+    clean_n_q = replace_na(clean_n_q, 0L),
+    diff_q    = clean_n_q - raw_n_q
+  )
+
+p_quarters <- ggplot(quarter_cmp, aes(x = raw_n_q, y = clean_n_q)) +
+  geom_abline(slope = 1, intercept = 0, color = "grey60", linetype = "dashed") +
+  geom_point(aes(color = diff_q), alpha = 0.6, size = 1.2) +
+  scale_color_gradient2(
+    low = "#3b4cc0",
+    mid = "#b0b0b0",
+    high = "#f95d6a",
+    midpoint = 0
+  ) +
+  labs(
+    title = "Number of rquarters per CIK: holdext_raw vs holdext_clean",
+    subtitle = "Points on the dashed line have equal quarter counts; points above it gained quarters in holdext_clean",
+    x = "Raw number of rquarters",
+    y = "Clean number of rquarters",
+    color = "Clean - raw"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.margin = margin(t = 15, r = 15, b = 20, l = 15),
+    plot.title.position = "plot",
+    plot.subtitle = element_text(margin = margin(b = 10))
+  )
+
+ggsave(
+  filename = file.path(qa_dir_05, "qa_quarters_raw_vs_clean.png"),
+  plot     = p_quarters,
+  width    = 8,
+  height   = 5,
+  dpi      = 300
+)
+```
+
+```{r}
+# Map raw rdate to quarter-end
+raw_quarter_map <- holdext_raw %>%
+  mutate(rdate = as_date(rdate)) %>%
+  distinct(cik, rdate) %>%
+  collect() %>% 
+  mutate(
+    rquarter = floor_date(rdate, "quarter") + months(3) - days(1)
+  )
+
+example_cik <- "0000002230"
+
+raw_series <- holdext_raw %>%
+  mutate(rdate = as_date(rdate)) %>%
+  inner_join(raw_quarter_map, by = c("cik", "rdate")) %>%
+  filter(cik == example_cik) %>%
+  group_by(cik, rquarter) %>%
+  summarise(raw_portfolio_value = sum(value, na.rm = TRUE), .groups = "drop")
+
+clean_series <- holdext_clean %>%
+  filter(cik == example_cik) %>%
+  group_by(cik, rquarter) %>%
+  summarise(clean_portfolio_value = sum(value, na.rm = TRUE), .groups = "drop")
+
+both <- raw_series %>%
+  inner_join(clean_series, by = c("cik", "rquarter")) %>%
+  collect() %>%  
+  mutate(
+    raw_b   = raw_portfolio_value   / 1e9,
+    clean_b = clean_portfolio_value / 1e9
+  )
+
+p_value <- ggplot(both, aes(x = rquarter)) +
+  geom_line(aes(y = raw_b,   color = "Raw")) +
+  geom_point(aes(y = raw_b,  color = "Raw"),  size = 1.2) +
+  geom_line(aes(y = clean_b, color = "Clean")) +
+  geom_point(aes(y = clean_b, color = "Clean"), size = 1.2) +
+  labs(
+    title = paste("Raw vs clean portfolio value for CIK", unique(both$cik)),
+    x = NULL,
+    y = "Portfolio value (billions USD)",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 12)
+
+ggsave(
+  filename = file.path(qa_dir_05, "qa_value_raw_vs_clean_example_cik.png"),
+  plot     = p_value,
+  width    = 7,
+  height   = 4.5,
+  dpi      = 300
+)
+```

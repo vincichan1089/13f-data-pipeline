@@ -1,0 +1,657 @@
+---
+title: "03_parse"
+author: "Vinci Chan"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc_expand: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 1. Load Package
+
+```{r}
+library(tidyverse)
+library(DBI)
+library(RSQLite)
+library(XML)
+library(future)
+library(furrr)
+
+source("R/config.R")
+source("R/utils_dates.R")
+source("R/utils_db.R")
+source("R/utils_cusip.R")
+```
+
+# 2. Setup
+
+```{r}
+dates <- make_quarter_tbl(
+  start_year    = 1996,
+  end_year      = cfg$end_year
+)
+
+qa_dir_03 <- file.path(cfg$qa_dir, "03")
+dir.create(qa_dir_03, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 3. Functions
+
+## 3.1. Determine table type
+
+```{r}
+determine.type <- function(table, numseps = 3, minspace = 3, min.frac = 0.5) {
+  table <- str_split(table, "\n") %>% pluck(1)
+
+  # 1. blank tables 
+  if (length(table) == 0) return("none")
+
+  # 2. xml
+  if (any(grepl("<[^/]*informationTable|</[^>]*informationTable", table))) return("xml")
+
+  # 3. other table types
+  n <- length(table)
+  
+  # compute separator scores: proportion of table rows that is separated with the delimiter
+  tabseps <- sum(lengths(strsplit(table, "\t")) - 1 >= numseps) / n
+  comseps <- sum(lengths(strsplit(table, ",")) - 1 >= numseps) / n
+  spaceseps <- sum(
+    vapply(
+      gregexpr("[[:alnum:]]\\s+", table), # search how many spaces used as delimiter each line
+      function(x) ifelse(all(x == -1), 0L, max(attr(x, "match.length"))), 
+      integer(1)
+    ) >= minspace
+  ) / n
+
+  # find winner
+  scores <- c(tab = tabseps, csv = comseps, fwf = spaceseps)
+  best <- which.max(scores)
+
+  if (is.na(scores[best]) || scores[best] < min.frac) return('csv')
+
+  return(names(best))
+}
+```
+
+## 3.2. Non-XML tables
+
+Function to quickly find the first instance of where any of "pattern" substrings occur in a string
+
+```{r}
+regmatches.multiple <- function(pattern, x, n, min.digits = 6, max.digits = 9) {
+  pattern_groups <- split(pattern, ceiling(seq_along(pattern) / n))
+
+  # find matches for each pattern group, keep row index
+  match_tbl <- map_dfr(pattern_groups, function(pat_grp) {
+    regex_pat <- str_c(pat_grp, collapse = "|")
+    m <- str_locate(x, regex(regex_pat, ignore_case = TRUE))
+
+    tibble(
+      row   = seq_along(x),
+      start = m[, "start"],
+      end   = m[, "end"]
+    )
+  })
+
+  # one row per original line: earliest non-NA start, matching end
+  match_tbl <- match_tbl %>%
+    group_by(row) %>%
+    summarise(
+      start = suppressWarnings(min(start, na.rm = TRUE)),
+      end   = suppressWarnings(end[which.min(start)]),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      start = ifelse(is.infinite(start), NA_integer_, start),
+      end   = ifelse(is.infinite(start), NA_integer_, end)
+    )
+
+  # get a chunk of 6-9 digits and allow for hyphen and spaces
+  cusip_regex <- str_c(
+    "^([[:alnum:]][ -]*){", min.digits - 1, ",", max.digits - 1, "}[[:alnum:]]"
+  )
+
+  base_tbl <- tibble(
+    row = seq_along(x),
+    x   = x
+  ) %>%
+    left_join(match_tbl, by = "row") %>%
+    mutate(
+      tail = if_else(
+        is.na(start),
+        NA_character_,
+        str_sub(x, start)
+      ),
+      cusip_span = if_else(
+        is.na(tail),
+        NA_character_,
+        str_extract(tail, regex(cusip_regex))
+      ),
+      match = if_else(
+        is.na(cusip_span),
+        NA_character_,
+        str_remove_all(cusip_span, "[[:space:]-]")
+      ),
+      match = if_else(
+        !is.na(match) &
+          str_length(match) >= min.digits &
+          str_length(match) <= max.digits,
+        match,
+        NA_character_
+      ),
+      end = if_else(
+        is.na(cusip_span),
+        NA_integer_,
+        start + str_length(cusip_span) - 1
+      )
+    )
+
+  list(
+    match = base_tbl$match,
+    start = base_tbl$start,
+    end   = base_tbl$end
+  )
+}
+```
+
+Function to split a row into cusip and its remainder, and extract character data
+
+```{r}
+cusip.remainder <- function(table, cusip_list) {
+  # find cusip matches and positions
+  cusip_key <- toupper(str_sub(cusip_list, 1, 6)) %>% unique() # get 6-digit issuer keys
+  out <- regmatches.multiple(cusip_key, table, max.digits = 9, n = 100)
+  cusip9 <- toupper(out$match)
+  end <- out$end
+
+  # shrsOrPrnAmt
+  tail_str <- str_sub(table, end, nchar(table))
+
+  shrsOrPrnAmt <- case_when(
+      str_detect(tail_str, regex("SH",   ignore_case = TRUE)) ~ "SH",
+      str_detect(tail_str, regex("PRN|PRIN", ignore_case = TRUE)) ~ "PRN",
+      TRUE ~ NA_character_
+    )
+
+  # putCall
+  putCall <- case_when(
+      str_detect(tail_str, regex("PUT",   ignore_case = TRUE)) ~ "PUT",
+      str_detect(tail_str, regex("CALL",  ignore_case = TRUE)) ~ "CALL",
+      TRUE ~ NA_character_
+    )
+
+  # investmentDiscretion
+  investmentDiscretion <- case_when(
+      str_detect(tail_str, regex("SOLE",             ignore_case = TRUE)) ~ "SOLE",
+      str_detect(tail_str, regex("OTHER|OTR|OTH",    ignore_case = TRUE)) ~ "OTR",
+      str_detect(tail_str, regex("DEFINED|DFND|DEF", ignore_case = TRUE)) ~ "DFND",
+      str_detect(tail_str, regex("SHARED",           ignore_case = TRUE)) ~ "SHARED",
+      TRUE ~ NA_character_
+    )
+
+  strings_to_cut <- c(
+      "SH", "PRN", "PRIN", "CALL", "PUT", "SOLE", "OTHER", "OTR", "OTH", "DEFINED", "DFND", "DEF", "SHARED", "YES"
+    )
+
+  regex_cut <- paste0(
+      "(^|[^[:alpha:]]{1})(",
+      paste0(strings_to_cut, collapse = "|"),
+      ")([^[:alpha:]]{1}|$)"
+    )
+
+  df <- tibble(
+    line = table,
+    end  = end
+  ) %>%
+  mutate(
+    tail_str = str_sub(line, end, nchar(line)),
+    loc = str_locate(tail_str, regex(regex_cut, ignore_case = TRUE)),
+    marker_start = loc[, "start"], # finds the start of the regex_cut match
+    remainder_end = if_else(
+      is.na(marker_start),
+      nchar(line),
+      end - 2L + marker_start # stop remainder one character earlier
+    ),
+    remainder = str_sub(line, end + 1, remainder_end)
+  )
+
+  tibble(
+    cusip9  = cusip9,
+    cusip8  = str_sub(cusip9, 1, 8),
+    shrsOrPrnAmt = shrsOrPrnAmt,
+    putCall = putCall,
+    investmentDiscretion = investmentDiscretion,
+    remainder = df$remainder
+  )
+}
+```
+
+Function to separate the remainder into groups of numbers
+
+```{r}
+separate.remainder <- function(rows, regex = "(\\d+|\\d{1,3}(,\\d{3})*)(\\.\\d*)?") {
+  # extract all numeric substrings per row (list-column)
+  numbers <- regmatches(rows, gregexpr(regex, rows))
+
+  # build tibble: one row per original row, list-cols hold raw and numeric values
+  tibble(
+    idx = seq_along(numbers),
+    raw = numbers
+  ) %>% 
+    mutate(
+      # remove commas, convert to numeric; empty -> NA
+      nums = lapply(raw, 
+        function(x) {
+          if (length(x) == 0) return(NA_real_)
+          as.numeric(gsub(",", "", x))
+        }
+      )
+    ) %>% 
+      # unnest to long format: one row per number
+      unnest_longer(nums, values_to = "value") %>% 
+      group_by(idx) %>% 
+      mutate(col_id = row_number()) %>% 
+      ungroup() %>% 
+      select(idx, col_id, value) %>% 
+      # widen
+      pivot_wider(
+        names_from = col_id,
+        values_from = value,
+        names_prefix = "num"
+      ) %>% 
+      arrange(idx) %>% 
+      select(-idx)
+}
+```
+
+Function to parse all non-xml tables (calls `cusip.remainder()`, `separate.remainder()`)
+
+```{r}
+parse.others <- function(table, cusip_list) {
+  # extract CUSIP and character field
+  data <- cusip.remainder(table, cusip_list)
+
+  # extract numeric fields
+  numbers <- separate.remainder(data$remainder)
+
+  # combined metadata + numeric columns
+  data <- bind_cols(data, numbers)
+
+  # rename num* column assuming first = value, second = shares
+  num_cols <- names(data) %>% keep(~ str_starts(.x, "num"))
+
+  if (length(num_cols) == 0L) {
+    warning("No numeric columns (num*) found in parse_others.", immediate. = TRUE)
+    value_col  <- NA_real_
+    shares_col <- NA_real_
+  } else if (length(num_cols) == 1L) {
+    value_col  <- NA_real_
+    shares_col <- data[[num_cols[1]]]
+  } else {
+    value_col  <- data[[num_cols[1]]]
+    shares_col <- data[[num_cols[2]]]
+  }
+
+  tibble(
+    nameOfIssuer        = NA_character_,
+    titleOfClass        = NA_character_,
+    cusip               = data$cusip9,     
+    value               = value_col,
+    shrsOrPrnAmt        = data$shrsOrPrnAmt,
+    investmentDiscretion = data$investmentDiscretion,
+    votingAuthority     = NA_character_,   
+    shares              = shares_col
+  )
+}
+```
+
+
+## 3.3. XML tables
+```{r}
+parse.xml <- function(table, cusip_list) {
+  info_start <- which(str_detect(table, "^\\s*<([A-Za-z0-9_]+:)?informationTable\\b"))[1]
+  if (!is.na(info_start)) {
+    xml_start <- info_start
+  } else {
+    xml_start <- which(str_detect(table, "^\\s*<\\?xml"))[1]
+    if (is.na(xml_start)) xml_start <- 1L
+  }
+
+  xml_content <- table[xml_start:length(table)] %>% 
+    paste(collapse = "\n")
+
+  xml_doc <- tryCatch(
+    xmlParse(xml_content),
+    error = function(e) {
+      warning("XML parse failed: ", conditionMessage(e), immediate. = FALSE)
+      return(NULL)
+    }
+  )
+
+  # if parse failed, return empty tibble
+  if (is.null(xml_doc)) {
+    return(tibble(
+      nameOfIssuer         = character(),
+      titleOfClass         = character(),
+      cusip                = character(),
+      value                = double(),
+      shrsOrPrnAmt         = character(),
+      investmentDiscretion = character(),
+      votingAuthority      = character(),
+      shares               = double()
+    ))
+  }
+
+  xmlToDataFrame(xml_doc, stringsAsFactors = FALSE) %>% 
+    as_tibble() %>% 
+    mutate(
+      cusip = str_remove_all(cusip, "[[:space:]-]"),
+      value = as.numeric(str_remove_all(value, "\n|\t| ")),
+      shares_temp = shrsOrPrnAmt,
+      shrsOrPrnAmt = case_when(
+        str_detect(shrsOrPrnAmt, "SH")  ~ "SH",
+        str_detect(shrsOrPrnAmt, "PRN") ~ "PRN",
+        TRUE ~ NA_character_
+      ),
+      shares = suppressWarnings(
+        as.numeric(str_remove_all(shares_temp, "\n|\t|SH|PRN| "))
+      ) 
+    ) %>% 
+    select(-shares_temp)
+}
+```
+
+## 3.4. Function to parse any table
+
+```{r}
+gsub.all <- function(pattern, replacement, x) {
+  if (length(pattern) == 0) return(x)
+
+  for (i in seq_along(pattern)) {
+    if (identical(pattern[i], "")) next
+    x <- gsub(pattern[i], replacement[i], x, fixed = TRUE)
+  }
+  x
+}
+```
+
+```{r}
+parse.one.table <- function(raw_text, cusip_list) {
+  table <- raw_text %>% str_split("\n") %>% pluck(1)
+  type  <- determine.type(raw_text)
+
+  if (type == "none") {
+    return(tibble(
+      nameOfIssuer         = character(),
+      titleOfClass         = character(),
+      cusip                = character(),
+      value                = double(),
+      shrsOrPrnAmt         = character(),
+      investmentDiscretion = character(),
+      votingAuthority      = character(),
+      shares               = double()
+    ))
+  }
+
+  if (type == "tab") {
+    table <- str_replace_all(table, "\t", " ")
+  } else if (type == "csv") {
+    quoted         <- regmatches(table, gregexpr("(\")(.*?)(\")", table))
+    quoted_nocomma <- map(quoted, ~ gsub("\\\"|,", "", .x))
+
+    table <- map_chr(seq_along(table), ~ {
+      gsub.all(quoted_nocomma[[.x]], quoted[[.x]], table[.x])
+    })
+
+    table <- str_replace_all(table, "\t|,", " ")
+  }
+
+  out <- if (type == "xml") {
+    parse.xml(table, cusip_list)
+  } else {
+    parse.others(table, cusip_list)
+  }
+
+  out %>%
+    mutate(table_type = type) %>%
+    select(
+      nameOfIssuer,
+      titleOfClass,
+      cusip,
+      value,
+      shrsOrPrnAmt,
+      investmentDiscretion,
+      votingAuthority,
+      shares,
+      table_type
+    )
+}
+```
+
+# 4. Quarterly wrapper
+
+```{r}
+build.quarter.tables <- function(year_qtr) {
+  con <- connect_sqlite(year_qtr)
+  on.exit(disconnect_sqlite(con), add = TRUE)
+
+  header_table <- tbl(con, "header_table") %>% as_tibble()
+
+  holdings_table_raw <- tbl(con, "holdings_table_raw") %>% as_tibble()
+
+  if (nrow(holdings_table_raw) == 0L) {
+    return(invisible(NULL))
+  }
+
+  yr  <- as.integer(substr(year_qtr, 1, 4))
+  use_cusip_join <- (yr >= 1996)
+
+  cusip_list <- if (use_cusip_join) get.cusip.vec(con, year_qtr) else character(0)
+
+  message("Parsing ", nrow(holdings_table_raw), " filings in parallel...")
+
+  plan(multisession)
+
+  parsed_list <- future_map(
+    as.character(holdings_table_raw$holding_text),
+    ~ parse.one.table(.x, cusip_list),
+    .progress = TRUE
+  )
+
+  plan(sequential)
+
+  # add filename, parsed list-column, and raw row count
+  raw_with_counts <- holdings_table_raw %>% 
+    mutate(
+      filename = FILENAME,
+      parsed = parsed_list,
+      raw_nrows = str_split(as.character(holding_text), "\n") %>% 
+        map_int(~ sum(.x != ""))
+    )
+
+  parsed_q <- raw_with_counts %>%
+    select(filename, parsed) %>%
+    unnest(parsed) %>%
+    left_join(
+      header_table %>%
+        select(filename = FILENAME, form, cik, cikname, rdate, fdate),
+      by = "filename"
+    ) %>%
+    select(
+      form, cik, cikname, rdate, fdate, filename,
+      nameOfIssuer, titleOfClass, cusip, value,
+      shrsOrPrnAmt, investmentDiscretion, votingAuthority, shares,
+      table_type
+    )
+
+  dbWriteTable(
+    con,
+    "holdings_table_parsed",
+    parsed_q,
+    overwrite = TRUE
+  )
+
+  rm(
+    header_table, holdings_table_raw, cusip_list,
+    parsed_list, raw_with_counts, parsed_q
+  )
+
+  gc()
+}
+```
+
+# 5. Loop over all quarters
+
+```{r}
+for (i in seq_along(dates$year_qtr)) {
+  yq <- dates$year_qtr[i]
+  message("=== Starting quarter ", yq, " (", i, "/", length(dates$year_qtr), ") ===")
+
+  start_time <- Sys.time()
+  message(start_time)
+
+  build.quarter.tables(yq)
+
+  end_time <- Sys.time()
+  elapsed <- end_time - start_time
+
+  message(
+    sprintf("Total time for %s: %.1f minutes (%.1f seconds)",
+            yq, as.numeric(elapsed, units = "mins"),
+            as.numeric(elapsed, units = "secs"))
+  )
+
+  gc()
+}
+```
+
+# 6. Parse summary
+
+```{r}
+parse_summary <- tibble(
+  year_qtr       = dates$year_qtr,
+  n_raw_nonzero  = NA_integer_,
+  n_parsed_some  = NA_integer_
+)
+
+for (i in seq_along(dates$year_qtr)) {
+  yq <- dates$year_qtr[i]
+  message(sprintf(
+    "\n=== Quarter %d/%d: %s ===",
+    i, length(dates$year_qtr), yq
+  ))
+
+  con <- connect_sqlite(yq)
+
+  raw_counts <- tbl(con, "holdings_table_raw") %>%
+    group_by(FILENAME) %>%
+    summarise(raw_nrows = n(), .groups = "drop")
+
+  parsed_counts <- tbl(con, "holdings_table_parsed") %>%
+    group_by(filename) %>%
+    summarise(parsed_nrows = n(), .groups = "drop")
+
+  joined <- raw_counts %>%
+    left_join(parsed_counts, by = c("FILENAME" = "filename")) %>%
+    collect() %>% 
+    mutate(parsed_nrows = replace_na(parsed_nrows, 0L))
+
+  parse_summary$n_raw_nonzero[i] <- sum(joined$raw_nrows > 0)
+  parse_summary$n_parsed_some[i] <- sum(joined$parsed_nrows > 0)
+
+  disconnect_sqlite(con)
+}
+
+parse_summary <- parse_summary %>%
+  mutate(
+    year_qtr = as.numeric(year_qtr),
+    pct_parsed_raw = n_parsed_some / pmax(n_raw_nonzero, 1L),
+    year = year_qtr %/% 10,
+    qtr  = year_qtr %% 10,
+    quarter_date = case_when(
+      qtr == 1 ~ ymd(paste0(year, "-02-15")),
+      qtr == 2 ~ ymd(paste0(year, "-05-15")),
+      qtr == 3 ~ ymd(paste0(year, "-08-15")),
+      qtr == 4 ~ ymd(paste0(year, "-11-15")),
+      TRUE     ~ NA_Date_
+    )
+  ) %>%
+  arrange(quarter_date)
+
+p_parse_qa <- ggplot(parse_summary, aes(x = quarter_date, y = pct_parsed_raw)) +
+  geom_hline(yintercept = 0.95, linetype = "dashed", color = "grey60") +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 1.5) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0, 1)
+  ) +
+  labs(
+    title = "Parsing success rate over time",
+    subtitle = "Share of filings with raw tables that produced parsed rows",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+write_csv(parse_summary, file.path(qa_dir_03, "parse_summary.csv"))
+
+ggsave(
+  filename = file.path(qa_dir_03, "parse_summary.png"),
+  plot     = p_parse_qa,
+  width    = 8,
+  height   = 4,
+  dpi      = 300
+)
+```
+
+# 7. Inspection
+
+```{r}
+#| eval: false
+
+# individual quarter inspection
+year_qtr <- 20093
+con <- connect_sqlite(year_qtr)
+
+raw_counts <- tbl(con, "holdings_table_raw") %>%
+  group_by(FILENAME) %>%
+  summarise(raw_nrows = n(), .groups = "drop")
+
+parsed_counts <- tbl(con, "holdings_table_parsed") %>%
+  group_by(filename) %>%
+  summarise(parsed_nrows = n(), .groups = "drop")
+
+filingQA <- raw_counts %>%
+  left_join(parsed_counts, by = c("FILENAME" = "filename")) %>%
+  mutate(parsed_nrows = replace_na(parsed_nrows, 0L))
+
+failure <- filingQA %>%
+  filter(parsed_nrows == 0 & raw_nrows != 0) %>%
+  pull(FILENAME)
+
+# look at first failure
+failed_raw <- tbl(con, "holdings_table_raw") %>%
+  filter(FILENAME %in% failure) %>%
+  as_tibble() %>%
+  mutate(raw = str_split(holding_text, "\n")) %>%
+  select(-holding_text)
+
+failed_raw %>%
+  pull(raw) %>%
+  pluck(1) %>%
+  head(20)
+
+failed_parsed <- tbl(con, "holdings_table_parsed") %>%
+  filter(filename %in% failure) %>%
+  as_tibble()
+
+disconnect_sqlite(con)
+rm(con, raw_counts, parsed_counts, filingQA, failure, failed_raw, failed_parsed)
+```

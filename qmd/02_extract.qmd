@@ -1,0 +1,418 @@
+---
+title: "02_extract"
+author: "Vinci Chan"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc_expand: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 1. Load Package
+
+```{r}
+library(tidyverse)
+library(DBI)
+library(RSQLite)
+library(future)
+library(furrr)
+
+source("R/config.R")
+source("R/utils_dates.R")
+source("R/utils_db.R")
+source("R/utils_cusip.R")
+```
+
+# 2. Setup
+
+```{r}
+plan(multisession)
+
+dates <- make_quarter_tbl(
+  start_year    = 1996,
+  end_year      = cfg$end_year,
+  start_month_day = "0701"
+)
+
+qa_dir_02 <- file.path(cfg$qa_dir, "02")
+dir.create(qa_dir_02, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 3. Functions
+
+## 3.1 Extract biographical info
+
+```{r}
+extract.bio <- function(year_qtr) {
+  con <- connect_sqlite(year_qtr)
+  on.exit(disconnect_sqlite(con))
+
+  # load "compsubm" table as compsubm_table
+  compsubm_table <- tbl(con, "compsubm") %>% as_tibble()
+
+  # function to retreive biographical info
+  get.header.value <- function(lines, pattern) {
+    out <- lines[grepl(pattern, lines)] %>% 
+      gsub("\\t", "", x = .) %>% 
+      gsub(pattern, "", x = .)
+  
+    # ensure length 1 (only one occurence)
+    if (length(out) == 0L) {
+      NA_character_
+    } else {
+      out[[1L]]
+    }
+  }
+
+  # get form type, rdate, fdate using get.header.value
+  header_table <- compsubm_table %>% 
+    mutate(lines = strsplit(COMLSUBFILE, "\n")) %>% 
+    rowwise() %>%
+    mutate(
+      form = get.header.value(lines, "CONFORMED SUBMISSION TYPE:"),
+      cik = get.header.value(lines, "CENTRAL INDEX KEY:"),
+      cikname = get.header.value(lines, "COMPANY CONFORMED NAME:"),
+      rdate = ymd(get.header.value(lines, "CONFORMED PERIOD OF REPORT:")),
+      fdate = ymd(get.header.value(lines, "FILED AS OF DATE:"))
+    ) %>% 
+    select(-COMLSUBFILE, -lines) %>% 
+    ungroup()
+
+  # write as new table in the same sqlite file
+  dbWriteTable(
+    con, 
+    name = "header_table",
+    value = header_table,
+    overwrite = TRUE
+  )
+}
+```
+
+## 3.2 Extract information table
+
+```{r}
+clean.block <- function(
+    x, 
+    use_cusip_join,
+    cusip_vec,
+    cusip_vec_8,
+    cusip_vec_7,
+    error.rows
+  ) {
+    x <- x[nzchar(trimws(x))]
+
+    if (use_cusip_join && length(cusip_vec) > 0) {
+      norm_line <- gsub("\\s|-", "", x)
+      has_cusip <- vapply(
+        norm_line,
+        function(xx) {
+          n <- nchar(xx)
+          if (n < 7) return (FALSE)
+          # check 9-char substrings against cusip_vec
+          if (n >= 9) {
+            s9 <- seq_len(n - 8)
+            if (any(substring(xx, s9, s9 + 8) %in% cusip_vec)) return(TRUE)
+          }
+          # check 8-char substrings against cusip_vec_8
+          if (n >= 8) {
+            s8 <- seq_len(n - 7)
+            if (any(substring(xx, s8, s8 + 7) %in% cusip_vec_8)) return(TRUE)
+          }
+          # check 7-char substrings against cusip_vec_7
+          s7 <- seq_len(n - 6)
+          any(substring(xx, s7, s7 + 6) %in% cusip_vec_7)
+        },
+        FUN.VALUE = logical(1)
+      )
+    } else {
+      has_cusip <- grepl("[0-9A-Z]{7,8}[0-9]?", gsub("\\s|-", "", x), ignore.case = TRUE)
+    }
+
+    x <- x[has_cusip]
+    x <- x[!grepl(paste0(error.rows, collapse = "|"), x, ignore.case = TRUE)]
+    num_chunks <- lengths(regmatches(x, gregexpr("\\d[\\d,\\.]*", x)))
+    x[num_chunks >= 3]
+  }
+```
+```{r}
+# function to detect info tables
+make.holdings <- function(
+  lines,
+  use_cusip_join,
+  cusip_vec,
+  cusip_vec_8,
+  cusip_vec_7,
+  error.rows
+) {
+  # 1. blank filings
+  if (all(!nzchar(trimws(lines)))) return(character(0))
+
+  # 2. XML informationTable (post-2013 May)
+  info_start <- grepl("<[^/]*informationTable", lines, ignore.case = TRUE)
+  info_end   <- grepl("</[^>]*informationTable", lines, ignore.case = TRUE)
+  if (any(info_start) && any(info_end)) {
+    start <- which(info_start)[1]
+    end   <- rev(which(info_end))[1]
+    return(lines[start:end])
+  }
+
+  hold <- character(0)
+
+  # 3. ASCII <TABLE> ... </TABLE> block
+  table_start <- grep("<TABLE>",  lines, ignore.case = TRUE)
+  table_end   <- grep("</TABLE>", lines, ignore.case = TRUE)
+
+  if (length(table_start) > 0L && length(table_end) > 0L) {
+    start_tbl <- table_start[1]
+    end_tbl   <- table_end[length(table_end)]
+    block_tbl <- lines[start_tbl:end_tbl]
+    hold_tbl  <- clean.block(
+      block_tbl,
+      use_cusip_join,
+      cusip_vec,
+      cusip_vec_8,
+      cusip_vec_7,
+      error.rows
+    )
+    if (length(hold_tbl) > 0L) hold <- hold_tbl
+    # if length == 0L, we fall through to fallback
+  }
+
+  # 4. Fallback if TABLE gave nothing (or no TABLE at all)
+  if (length(hold) == 0L) {
+    idx_hdr  <- which(grepl("</SEC-HEADER>", lines, ignore.case = TRUE))
+    start_fb <- if (length(idx_hdr)) max(idx_hdr) + 1L else 1L
+    block_fb <- lines[start_fb:length(lines)]
+    hold_fb  <- clean.block(
+      block_fb,
+      use_cusip_join,
+      cusip_vec,
+      cusip_vec_8,
+      cusip_vec_7,
+      error.rows
+    )
+    hold <- hold_fb
+  }
+
+  hold
+}
+```
+```{r}
+extract.holdings <- function(year_qtr) {
+  con <- connect_sqlite(year_qtr)
+  on.exit(disconnect_sqlite(con))
+
+  # decide if we use CUSIP- or regex-filtering for this quarter
+  yr <- as.integer(substr(year_qtr, 1, 4))
+  use_cusip_join <- (yr >= 1996)
+
+  cusip_vec <- if (use_cusip_join) get.cusip.vec(con, year_qtr) else character(0)
+  cusip_vec_8 <- if (length(cusip_vec) > 0) substr(cusip_vec, 1, 8) else character(0)
+  cusip_vec_7 <- if (length(cusip_vec) > 0) substr(cusip_vec, 1, 7) else character(0)
+
+  # load "compsubm" table as compsubm_table
+  compsubm_table <- tbl(con, "compsubm") %>% 
+    as_tibble() %>% 
+    mutate(lines = strsplit(COMLSUBFILE, "\n"))
+
+  # common blacklist
+  error.rows <- c(
+    "<SEC-DOCUMENT>", "<SEC-HEADER>", "ACCESSION NUMBER:",
+    "<ACCEPTANCE-DATETIME>", "<FILENAME>", "<phone>", "Phone:",
+    "</additionalInformation>", "FORM 13F", "INFORMATION TABLE",
+    "SUMMARY PAGE", "RUN DATE", "PAGE",
+    "List of Other Managers", "SECURITIES AND EXCHANGE COMMISSION",
+    "ITEM ", "ITEM1", "ITEM 1:", "COL ", "COL1", "COLUMN", "Suite", "<DESCRIPTION>"
+  )
+
+  use_parallel <- as.integer(year_qtr) < 20132 # future_map() doesn't work on xml files as the files are too big
+
+  message("  Mode: ", if (use_parallel) "parallel (future_map)" else "sequential (map)")
+
+  if (use_parallel) {
+    holding_lines <- future_map(
+      compsubm_table$lines,
+      ~ make.holdings(
+        .x,
+        use_cusip_join = use_cusip_join,
+        cusip_vec      = cusip_vec,
+        cusip_vec_8    = cusip_vec_8,
+        cusip_vec_7    = cusip_vec_7,
+        error.rows     = error.rows
+      ),
+      .progress = TRUE,
+      .options = furrr_options(
+        globals = c(
+          "make.holdings",
+          "clean.block",
+          "use_cusip_join",
+          "cusip_vec",
+          "cusip_vec_8",
+          "cusip_vec_7",
+          "error.rows"
+        )
+      )
+    )
+  } else {
+    holding_lines <- map(
+      compsubm_table$lines,
+      ~ make.holdings(
+        .x,
+        use_cusip_join = use_cusip_join,
+        cusip_vec      = cusip_vec,
+        cusip_vec_8    = cusip_vec_8,
+        cusip_vec_7    = cusip_vec_7,
+        error.rows     = error.rows
+      )
+    )
+  }
+
+  holdings_table_raw <- tibble(
+    FILENAME = compsubm_table$FILENAME,
+    holding_text = vapply(holding_lines, paste, collapse = "\n", FUN.VALUE = character(1))
+  )
+
+  dbWriteTable(
+    con, 
+    "holdings_table_raw",
+    holdings_table_raw,
+    overwrite = TRUE
+  )
+}
+```
+
+# 4. Loop all functions
+
+```{r}
+for (i in seq_along(dates$year_qtr)) {
+  
+  yq <- dates$year_qtr[i]
+
+  message(sprintf(
+    "\n=== Quarter %d/%d: %s ===",
+    i, length(dates$year_qtr), yq
+  ))
+  start_time <- Sys.time()
+  message(start_time)
+
+  message("Running extract.bio for ", yq, "...")
+  extract.bio(yq)
+  message("Finished extract.bio for ", yq)
+
+  message("Running extract.holdings for ", yq, " (up to 15 minutes)... ")
+  extract.holdings(yq)
+  message("Finished extract.holdings for ", yq)
+
+  end_time <- Sys.time()
+  elapsed <- end_time - start_time
+
+  message(
+    sprintf("Total time for %s: %.1f minutes (%.1f seconds)",
+            yq, as.numeric(elapsed, units = "mins"),
+            as.numeric(elapsed, units = "secs"))
+  )
+}
+```
+
+# 5. Extract summary
+
+```{r}
+summarise_extract_quarter <- function(year_qtr) {
+  con <- connect_sqlite(year_qtr)
+  on.exit(disconnect_sqlite(con), add = TRUE)
+
+  tables <- dbListTables(con)
+
+  if (!"holdings_table_raw" %in% tables) {
+    return(tibble(
+      year_qtr = year_qtr,
+      n_filings = NA_integer_,
+      n_empty = NA_integer_
+    ))
+  }
+
+  out <- dbReadTable(con, "holdings_table_raw") %>%
+    as_tibble() %>%
+    summarise(
+      n_filings = n(),
+      n_empty = sum(holding_text == "", na.rm = TRUE)
+    ) %>%
+    mutate(year_qtr = year_qtr, .before = 1)
+
+  out
+}
+```
+```{r}
+extract_summary <- map_dfr(dates$year_qtr, summarise_extract_quarter, .progress = TRUE) %>%
+  mutate(pct_empty = n_empty / n_filings)
+
+write_csv(extract_summary, file.path(qa_dir_02, "extract_summary.csv"))
+```
+```{r}
+plot_df <- extract_summary %>%
+  filter(!is.na(n_filings)) %>%
+  mutate(
+    year = as.integer(substr(year_qtr, 1, 4)),
+    qtr  = as.integer(substr(year_qtr, 5, 5)),
+    date = yq(paste0(year, " Q", qtr)),
+    pct_empty = pct_empty * 100
+  )
+
+p_extract_qa <- plot_df %>%
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = pct_empty, color = "Empty filings (%)")) +
+  geom_point(aes(y = pct_empty, color = "Empty filings (%)"), size = 0.6) +
+  geom_line(aes(y = n_filings / 100, color = "Total filings")) +
+  scale_y_continuous(
+    name = "Empty filings (%)",
+    sec.axis = sec_axis(~ . * 100, name = "Total filings")
+  ) +
+  scale_color_manual(values = c(
+    "Empty filings (%)" = "steelblue",
+    "Total filings" = "darkorange"
+  )) +
+  labs(
+    x = "Quarter",
+    color = NULL,
+    title = "Extraction quality vs. number of 13F filings over time"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave(
+  filename = file.path(qa_dir_02, "extract_summary.png"),
+  plot     = p_extract_qa,
+  width    = 8,
+  height   = 4,
+  dpi      = 300
+)
+```
+
+# 6. Inspection
+
+```{r}
+#| eval: false
+
+# individual quarter inspection
+year_qtr <- 20024
+con <- connect_sqlite(year_qtr)
+
+empty_filenames <- tbl(con, "holdings_table_raw") %>% 
+  filter(holding_text == "") %>% 
+  pull(FILENAME) %>% 
+  head(100)
+
+empty_compfilings <- tbl(con, "compsubm") %>% 
+  filter(FILENAME %in% empty_filenames) %>% 
+  as_tibble() %>% 
+  mutate(lines = strsplit(COMLSUBFILE, "\n")) %>% 
+  select(-COMLSUBFILE)
+empty_compfilings[[1,2]] # toggle row number to view individual complete filings
+
+disconnect_sqlite(con)
+rm(con)
+```

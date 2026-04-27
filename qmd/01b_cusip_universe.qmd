@@ -1,0 +1,436 @@
+---
+title: "01b_cusip_universe"
+author: "Vinci Chan"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc_expand: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+Points to note:
+
+1. Quarters unavailable for download: 1997Q4
+2. 2002Q3 and 2002Q4 has fewer than normal CUSIPS which can affect downstream extraction
+
+# 1. Load Package
+
+```{r}
+library(tidyverse)
+library(DBI)
+library(RSQLite)
+library(pdftools)
+
+source("R/config.R")
+source("R/utils_dates.R")
+source("R/utils_db.R")
+```
+
+# 2. Setup
+
+```{r}
+dates <- make_quarter_tbl(
+  start_year    = 1996, # start at 1996 as the lists are only made available since 1996
+  end_year      = cfg$end_year,
+)
+
+qa_dir_01b <- file.path(cfg$qa_dir, "01b")
+dir.create(qa_dir_01b, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 3. Create SEC list pdf urls
+
+```{r}
+input <- dates %>% 
+  mutate(
+    link = case_when(
+      year == 2004 & qtr == 1 ~ 
+        "https://www.sec.gov/divisions/investment/13f-list.pdf", # special case
+      year < 2021 ~ 
+        paste0("https://www.sec.gov/divisions/investment/13f/13flist", year, "q", qtr, ".pdf"),
+      year == 2021 & qtr <= 2 ~
+        paste0("https://www.sec.gov/divisions/investment/13f/13flist", year, "q", qtr, ".pdf"),
+      TRUE ~
+        paste0("https://www.sec.gov/files/investment/13flist", year, "q", qtr, ".pdf")
+    )
+  )
+```
+
+# 3. Functions
+
+## 3.1. Parse one page of the pdf into a table
+
+```{r}
+parse.one.page <- function(page, mode = c("post", "pre")) {
+  mode <- match.arg(mode)
+
+  if (!any(grepl("CUSIP NO", page))) return(NULL)
+
+  # remove rows above header
+  page <- page[min(which(grepl("CUSIP NO", page))):length(page)]
+
+  if (mode == "post") {
+    header <- page[1]
+
+    seps <- c(
+      0,
+      gregexpr("ISSUER NAME", header)[[1]][1] - 1,
+      gregexpr("ISSUER DESCRIPTION", header)[[1]][1] - 1,
+      gregexpr("STATUS", header)[[1]][1] - 1,
+      max(nchar(page))
+    )
+
+    split.row <- function(row, seps) {
+      n_cols <- length(seps) - 1
+      out <- character(n_cols)
+
+      for (i in seq_len(n_cols)) {
+        start <- seps[i] + 1
+        end   <- seps[i + 1]
+        out[i] <- trimws(substr(row, start, end))
+      }
+      out
+    }
+
+    rows <- lapply(page, split.row, seps = seps)
+    cn   <- c("cusip", "issuer_name", "issuer_description", "status")
+
+  } else { # mode == "pre"
+    seps <- c(0, 10, max(nchar(page)))
+
+    split.row <- function(row, seps) {
+      vapply(
+        seq_len(length(seps) - 1),
+        function(i) trimws(substr(row, seps[i] + 1, seps[i + 1])),
+        character(1)
+      )
+    }
+
+    rows <- lapply(page, split.row, seps = seps)
+    cn   <- c("cusipno", "other")
+  }
+
+  matrix <- do.call(rbind, rows)
+  if (nrow(matrix) <= 2) return(NULL)
+
+  colnames(matrix) <- cn
+  as_tibble(matrix[-1, , drop = FALSE])
+}
+```
+
+## 3.2. Download individual pdfs, calls parse.one.page() and create a table for the whole pdf
+
+```{r}
+download.sec.list <- function(link, year) {
+  pre2004 <- year < 2004
+  mode    <- if (pre2004) "pre" else "post"
+
+  tmp_pdf <- file.path(cfg$staging_dir, "tmp_cusip.pdf")
+
+  ok <- FALSE
+  for (attempt in 1:3) {
+    cat(sprintf("Attempt %d/3 for %s\n", attempt, basename(link)))
+    res <- try(
+      download.file(
+        link,
+        tmp_pdf,
+        headers = c("User-Agent" = cfg$sec_user_agent),
+        mode    = "wb",
+        quiet   = TRUE
+      ),
+      silent = TRUE
+    )
+
+    if (!inherits(res, "try-error")) {
+      ok <- TRUE
+      break
+    }
+
+    cat("Download failed, waiting 30s before retry \n")
+    Sys.sleep(30)
+  }
+
+  if (!ok) {
+    unlink(tmp_pdf)
+    stop("Failed to download PDF after 3 attempts ", link)
+  }
+
+  if (pre2004) {
+    pdf   <- pdf_ocr_text(tmp_pdf)
+  } else {
+    pdf   <- pdf_text(tmp_pdf)
+  }
+
+  pages       <- strsplit(pdf, "\n")
+  page_tables <- lapply(pages, parse.one.page, mode = mode)
+
+  unlink(tmp_pdf)
+
+  out <- page_tables %>% purrr::compact() %>% bind_rows()
+  as_tibble(out)
+}
+```
+
+## 3.3. Clean table
+
+### 3.3.1. Post-2004
+
+```{r}
+clean.cusip.list.post <- function(cusip_df) {
+  cusip_df %>% 
+    filter(!is.na(cusip)) %>% 
+    mutate(
+      asterisk = grepl("\\*", cusip),
+      cusip = gsub("\\s|\\*", "", cusip)
+    ) %>% 
+    relocate(asterisk, .after = cusip) %>% 
+    mutate(nchar = nchar(cusip)) %>% 
+    filter(nchar == 9) %>% 
+    distinct(cusip, .keep_all = TRUE)
+}
+```
+
+### 3.3.2. Pre-2004
+
+```{r}
+checksum.check <- function(cusip, return.check = TRUE) {
+  # helper: contribution of one char at position pos
+  checksum.value <- function(x, pos) {
+    # map digit → 0–9, letter → 10–35
+    x <- ifelse(grepl("[[:digit:]]", x),
+                as.numeric(x),
+                which(x == LETTERS) + 9)
+
+    # double if even position
+    x <- ifelse(pos %% 2 == 0, 2 * x, x)
+
+    # sum decimal digits (e.g. 16 → 1 + 6 = 7)
+    x <- floor(x / 10) + (x %% 10)
+    x
+  }
+
+  # 1. remove spaces
+  cusip <- gsub("\\s", "", cusip)
+
+  # 2. split each CUSIP into characters
+  cusip_split <- strsplit(cusip, "")
+
+  # 3. compute sum of contributions over positions 1–8
+  sums <- lapply(cusip_split, function(chars) {
+    total <- 0
+    for (pos in 1:8) {
+      total <- total + checksum.value(chars[pos], pos)
+    }
+    total
+  })
+
+  # 4. implied check digit for each CUSIP
+  value <- lapply(sums, function(x) (10 - (x %% 10)) %% 10)
+
+  # 5. compare to 9th character
+  check <- lapply(seq_along(value), function(i) {
+    chars9 <- cusip_split[[i]][9]
+    if (is.na(chars9)) return(FALSE)
+    chars9 == as.character(value[[i]])
+  })
+  check <- lapply(check, function(x) ifelse(is.na(x), FALSE, x))
+
+  # 6) return either logical flags or check digits
+  if (return.check) {
+    unlist(check)
+  } else {
+    unlist(value)
+  }
+}
+```
+
+```{r}
+clean.cusip.list.pre <- function(cusip_df) {
+  table <- cusip_df
+  table <- table %>%
+    filter(!is.na(cusipno), !is.na(other)) %>% # remove NAs
+    filter(!cusipno == "", !other == "") %>% # remove empty lines
+    filter(!grepl("total", cusipno, ignore.case = TRUE)) # remove cusipnos that have "TOTAL"
+
+  cusips <- trimws(toupper(table$cusipno))
+  others <- trimws(table$other)
+
+  # list of OCR issues, their replacements, and other erros
+  issues <- c('4%', '%', '\\.', '^\\|', '\\|', '8\\&$', '\\&', 'J/', '/ ', '/', ')', 'G@|4@|@', ' 1] ', '1]|]j|]', '¥Y|¥', '§', '\\?', '\\$', '}$', '}')
+  replace <- c('', '4', '', '', '1', '', '8', 'J', 'J', '', 'J', '4', '11', '1', 'Y', '4', '7', '3', '1', '')
+  errors <- c(';', "'", '\\+', '°', '=', ',', '\\(', '~', '¢', '\\_', '\\:', '\\#', '\\.', '-', '—')
+
+  # remove errors
+  for (i in seq_len(length(errors))) {
+    cusips <- gsub(errors[i], "", cusips)
+  }
+
+  # validate cusips
+  check <- checksum.check(cusips)
+
+  # for cusips that returned FALSE in checksum
+  for (i in seq_len(length(issues))) {
+    candidate1 <- trimws(gsub(issues[i], replace[i], cusips[check != TRUE])) # correct issues with issues and replace
+    candidate2 <- trimws(gsub("[^[:alnum:][:space:]]", "", cusips[check != TRUE])) # remove non-alphanumeric and non-space characters
+
+    candidate1_check <- checksum.check(candidate1)
+    candidate2_check <- checksum.check(candidate2)
+
+    # default to candidate 1
+    combined <- candidate1
+    combined_check <- candidate1_check
+    inds <- candidate2_check == TRUE & !is.na(candidate2_check)
+    combined[inds] <- candidate2[inds]
+    combined_check[inds] <- candidate2_check[inds]
+
+    cusips[check != TRUE] <- combined
+    check[check!= TRUE] <- combined_check
+  }
+
+  cusips <- gsub("[^[:alnum:]]", "", cusips) # remove all spaces
+
+  # lengthen cusips shorter than 9 characters
+  short <- nchar(cusips) < 9
+  cusips[short] <- paste0(cusips[short], substr(gsub("[^[:alnum:]]", "", others[short]), 1, 9 - nchar(cusips[short])))
+
+  # shorten cusips longer than 9 characters
+  long <- nchar(cusips) > 9
+  cusips[long] <- substr(cusips[long], 1, 9)
+
+  # update table
+  table$cusipno <- cusips
+  table$other <- others
+
+  # drop rows with only letters
+  table %>% 
+    filter(grepl("[0-9]", cusipno)) %>% 
+    mutate(check = checksum.check(cusipno)) %>% 
+    select(cusipno, check) %>% 
+    distinct(cusipno, .keep_all = TRUE)
+}
+```
+
+# 4. Loop over all quarters in "input"
+
+```{r}
+for (i in seq_len(nrow(input))) {
+  this_link  <- input$link[i]
+  this_yrqtr <- input$year_qtr[i]
+  this_yr    <- year(input$date[i])
+  pre2004    <- this_yr < 2004
+
+  sqlite_file <- sqlite_path(this_yrqtr)
+
+  cat("Processing", i, "of", nrow(input), "year_qtr =", this_yrqtr, "\n")
+
+  start_time <- Sys.time()
+  message(start_time)
+
+  cusip_df <- try(download.sec.list(this_link, this_yr), silent = TRUE)
+  if (inherits(cusip_df, "try-error")) {
+    cat("  → FAILED, skipping", this_yrqtr, "\n\n")
+    next
+  }
+
+  con <- dbConnect(SQLite(), sqlite_file)
+
+  if (pre2004) {
+    clean_cusip <- clean.cusip.list.pre(cusip_df)
+  } else {
+    clean_cusip <- clean.cusip.list.post(cusip_df)
+  }
+
+  cat("  →", nrow(clean_cusip), "unique 13F CUSIPs\n\n")
+
+  dbWriteTable(
+    con,
+    "cusip_list",
+    clean_cusip,
+    overwrite = TRUE
+  )
+
+  dbDisconnect(con)
+
+  end_time <- Sys.time()
+  elapsed <- end_time - start_time
+
+  message(
+    sprintf("Total time for %s: %.1f minutes (%.1f seconds)",
+            yq, as.numeric(elapsed, units = "mins"),
+            as.numeric(elapsed, units = "secs"))
+}
+```
+
+# 5. Output Summary
+
+```{r}
+cusip_summary <- tibble(
+  year_qtr = dates$year_qtr,
+  n_cusip  = NA_integer_
+)
+
+for (i in seq_along(dates$year_qtr)) {
+  yq <- dates$year_qtr[i]
+
+  message(sprintf(
+    "\n=== Quarter %d/%d: %s ===",
+    i, length(dates$year_qtr), yq
+  ))
+  message(Sys.time())
+
+  sqlite_file <- sqlite_path(yq)
+
+  if (!file.exists(sqlite_file)) {
+    message("No SQLite file for ", yq, "; skipping.")
+    next
+  }
+
+  con <- dbConnect(SQLite(), sqlite_file)
+
+  if (!dbExistsTable(con, "cusip_list")) {
+    message("No cusip_list table for ", yq, "; skipping.")
+    dbDisconnect(con)
+    next
+  }
+
+  n_rows <- tbl(con, "cusip_list") %>% tally(name = "n") %>% pull(n)
+  cusip_summary$n_cusip[i] <- n_rows
+  dbDisconnect(con)
+}
+
+cusip_summary <- cusip_summary %>%
+  mutate(
+    year = as.integer(substr(year_qtr, 1, 4)),
+    qtr  = as.integer(substr(year_qtr, 5, 5))
+  ) %>%
+  arrange(year, qtr)
+
+p_cusip_qa <- ggplot(cusip_summary, aes(x = year + (qtr - 1) / 4, y = n_cusip)) +
+  geom_line(color = "steelblue") +
+  geom_point(size = 0.6) +
+  scale_x_continuous(
+    breaks = seq(min(cusip_summary$year), max(cusip_summary$year), by = 2),
+    minor_breaks = NULL
+  ) +
+  labs(
+    title = "Number of CUSIPs by Quarter",
+    x = "Year",
+    y = "Number of CUSIPs"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(
+  filename = file.path(qa_dir_01b, "cusip_summary.png"),
+  plot     = p_cusip_qa,
+  width    = 8,
+  height   = 4,
+  dpi      = 300
+)
+```

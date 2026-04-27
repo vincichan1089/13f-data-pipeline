@@ -1,0 +1,114 @@
+---
+title: "04_combine"
+author: "Vinci Chan"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc_expand: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 1. Setup
+
+```{r}
+library(tidyverse)
+library(DBI)
+library(RSQLite)
+library(lubridate)
+library(future)
+library(furrr)
+library(arrow)
+
+source("R/config.R")
+source("R/utils_db.R")
+```
+
+# 2. Get file paths
+
+```{r}
+sqlite_files <- list.files(
+  cfg$sqlite_dir,
+  pattern   = "\\.sqlite$",
+  full.names = TRUE
+) %>%
+  sort()
+
+length(sqlite_files)
+head(sqlite_files)
+```
+
+# 3. Combine tables
+
+```{r}
+read_quarter_holdings <- function(sqlite_path) {
+  yq <- basename(sqlite_path) %>%
+    str_remove("\\.sqlite$") %>%
+    as.integer()
+
+  year <- yq %/% 10
+  qtr  <- yq %% 10
+
+  if (!(qtr %in% 1:4)) {
+    warning("Invalid quarter in file: ", sqlite_path, immediate. = FALSE)
+    return(tibble())
+  }
+
+  con <- dbConnect(SQLite(), sqlite_path)
+  on.exit(dbDisconnect(con), add = TRUE)
+
+  if (!dbExistsTable(con, "holdings_table_parsed")) {
+    return(tibble())
+  }
+
+  df <- dbReadTable(con, "holdings_table_parsed") %>% as_tibble()
+
+  df %>%
+    mutate(
+      year_qtr = yq,
+      year = year,
+      qtr = qtr,
+      quarter_label = paste0(year, " Q", qtr),
+      quarter_date = case_when(
+        qtr == 1 ~ ymd(paste0(year, "-02-15")),
+        qtr == 2 ~ ymd(paste0(year, "-05-15")),
+        qtr == 3 ~ ymd(paste0(year, "-08-15")),
+        qtr == 4 ~ ymd(paste0(year, "-11-15"))
+      )
+    )
+}
+```
+
+```{r}
+plan(multisession)
+
+all_holdings <- future_map_dfr(
+  sqlite_files,
+  read_quarter_holdings,
+  .progress = TRUE
+)
+
+plan(sequential)
+gc()
+
+nrow(all_holdings)
+n_distinct(all_holdings$year_qtr)
+n_distinct(all_holdings$filename)
+```
+
+```{r}
+# write to parquet (for downstream cleaning and analysis)
+write_parquet(
+  all_holdings,
+  file.path(cfg$derived_dir, "all_holdings.parquet")
+)
+```
+
+```{r}
+# quick QA check
+all_holdings %>%
+  count(year_qtr, quarter_label, sort = FALSE)
+```

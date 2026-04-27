@@ -1,0 +1,182 @@
+---
+title: "01a_redownload_missing_files"
+author: "Vinci Chan"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc_expand: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 1. Setup
+
+```{r}
+library(data.table)
+library(lubridate)
+library(tidyverse)
+library(DBI)
+library(RSQLite)
+
+source("R/config.R")
+source("R/utils_dates.R")
+source("R/utils_db.R")
+
+dates <- make_quarter_tbl(
+  start_year = cfg$start_year,
+  end_year   = cfg$end_year,
+)
+```
+
+# 2. Functions
+
+## 2.1. Identify missing files
+
+```{r}
+find.missing.file <- function(year_qtr) {
+  master_file_path <- file.path(cfg$master_index_dir, paste0("master_", year_qtr, ".csv"))
+  sqlite_file_path <- sqlite_path(year_qtr)
+
+  # Load master
+  master <- read_csv(master_file_path, show_col_types = FALSE)
+
+  # Load filenames from SQLite
+  con <- dbConnect(SQLite(), sqlite_file_path)
+  on.exit(dbDisconnect(con), add = TRUE)
+
+  db_files <- tbl(con, "compsubm") %>%
+    select(FILENAME) %>%
+    distinct() %>% 
+    as_tibble()
+
+  # Find rows that do not match
+  missing <- master %>%
+    anti_join(db_files, by = c("file" = "FILENAME"))
+
+  missing
+}
+```
+
+# 2.2. Redownload missing files
+
+```{r}
+dwnld.files <- function(missing) {
+  dir.create(cfg$staging_dir, showWarnings = FALSE, recursive = TRUE)
+  missing <- missing %>% distinct(file, .keep_all = TRUE)
+
+  pb <- txtProgressBar(min = 0, max = nrow(missing), style = 3)
+
+  for (j in seq_len(nrow(missing))) {
+    file_path <- file.path(cfg$staging_dir, missing$file[j])
+
+    success <- FALSE
+    for (attempt in 1:3) {
+      tryCatch(
+        {
+          download.file(
+            missing$link[j],
+            file_path,
+            quiet   = TRUE,
+            headers = c("User-Agent" = cfg$sec_user_agent),
+            mode    = "wb"
+          )
+          success <- TRUE
+          break
+        },
+        error = function(e) {
+          wait <- 5 * attempt        # 5s, 10s, 15s
+          cat(sprintf(
+            "\nFile %d/%d attempt %d failed, waiting %ds\n",
+            j, nrow(missing), attempt, wait
+          ))
+          Sys.sleep(wait)
+        }
+      )
+    }
+
+    if (!success) {
+      cat(sprintf(
+        "\n*** Gave up on filing %d/%d: %s ***\n",
+        j, nrow(missing), missing$file[j]
+      ))
+    }
+
+    setTxtProgressBar(pb, j)
+    Sys.sleep(0.13)   # ~7 requests/sec, conservative
+  }
+
+  close(pb)
+  cat("\nQuarter missing filings downloaded (a few may still be skipped)\n")
+}
+```
+
+# 2.3. Add missing files to SQLite
+
+```{r}
+put.files.in.sql <- function(dbname) {
+  together <- function(x) paste(x, collapse = "\n")
+
+  con <- dbConnect(SQLite(), dbname = dbname)
+
+  path <- cfg$staging_dir
+  files <- list.files(path)
+  n <- length(files)
+
+  if (n == 0) {
+    message("No files in staging_dir; nothing to add to SQLite")
+    dbDisconnect(con)
+    unlink(cfg$staging_dir, recursive = TRUE)
+    return(invisible(NULL))
+  }
+
+  step <- 500
+  for (i in 1:(n %/% step + 1)) {
+    start <- 1 + (i - 1) * step
+    end   <- i * step
+    ind   <- start:min(end, n)
+
+    objects <- lapply(file.path(path, files[ind]), readLines)
+    clean   <- lapply(objects, together)
+
+    data <- data.frame(
+      FILENAME   = files[ind],
+      COMLSUBFILE = unlist(clean),
+      stringsAsFactors = FALSE
+    )
+
+    dbWriteTable(con, "compsubm", data, append = TRUE)
+  }
+
+  dbDisconnect(con)
+  unlink(cfg$staging_dir, recursive = TRUE)
+}
+```
+
+# 3. Loop over all quarters
+
+```{r}
+for (i in seq_len(nrow(dates))) {
+  cat(sprintf(
+    "\n=== Quarter %d/%d: %s ===\n",
+    i, nrow(dates), dates$year_qtr[i]
+  ))
+  print(Sys.time())
+
+  missing <- find.missing.file(dates$year_qtr[i])
+
+  if (nrow(missing) > 0) {
+    cat("Redownloading", nrow(missing),
+        "missing filings for", dates$year_qtr[i], "\n")
+    dwnld.files(missing)
+  } else {
+    cat("No missing filings for", dates$year_qtr[i], "\n")
+  }
+
+  cat("Loading to SQL...\n")
+  put.files.in.sql(sqlite_path(dates$year_qtr[i]))
+  cat("Missing filings loaded to SQL\n")
+}
+```

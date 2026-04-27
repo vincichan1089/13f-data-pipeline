@@ -1,0 +1,114 @@
+---
+title: "06_analysis"
+author: "Vinci Chan"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc_expand: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 1. Setup
+
+```{r}
+library(tidyverse)
+library(arrow)
+library(here)
+
+source("R/config.R")
+```
+
+# 2. Data Import
+
+```{r}
+holdext_clean_path <- file.path(cfg$derived_dir, "holdext_clean_parquet")
+holdext_clean <- open_dataset(holdext_clean_path)
+```
+
+# 3. Data Analysis
+
+## 3.1. Manager selection
+
+```{r}
+# cik/rquarter panel
+returns_by_fund <- holdext_clean %>%
+  to_duckdb() %>%
+  group_by(cik, rquarter) %>%
+  summarise(
+    total_value = sum(value, na.rm = TRUE),
+    n_holdings = n(),
+    .groups = "drop"
+  ) %>%
+  collect() %>% 
+  arrange(cik, rquarter) %>%
+  group_by(cik) %>%
+  mutate(
+    prev_value = lag(total_value),
+    quarterly_return = (total_value - prev_value) / prev_value
+  ) %>%
+  ungroup()
+
+# Calculate performance metrics by fund
+fund_metrics <- returns_by_fund %>%
+  group_by(cik) %>%
+  filter(n() >= 2) %>% 
+  summarise(
+    n_quarters = n(),
+    mean_holdings = mean(n_holdings, na.rm = TRUE),
+    mean_return = mean(quarterly_return, na.rm = TRUE),
+    sd_return = sd(quarterly_return, na.rm = TRUE),
+    min_return = min(quarterly_return, na.rm = TRUE),
+    max_return = max(quarterly_return, na.rm = TRUE),
+    # Sharpe ratio (assuming risk-free rate of 0 for simplicity)
+    sharpe_ratio = mean_return / sd_return,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(sharpe_ratio))
+```
+```{r}
+# Calibrate n_holdings and n_quarters
+fund_metrics %>% 
+  summarise(
+    funds_total = n(),
+    mean_holdings = mean(mean_holdings, na.rm = TRUE),
+    median_holdings = median(mean_holdings, na.rm = TRUE),
+    mean_quarters = mean(n_quarters),
+    median_uarters = median(n_quarters)
+  )
+
+bind_rows(
+  tibble(threshold = "≥5 holdings, ≥2yr", 
+         n = nrow(fund_metrics %>% filter(mean_holdings >= 5, n_quarters >= 8))),
+  tibble(threshold = "≥10 holdings, ≥2yr", 
+         n = nrow(fund_metrics %>% filter(mean_holdings >= 10, n_quarters >= 8))),
+  tibble(threshold = "≥20 holdings, ≥3yr", 
+         n = nrow(fund_metrics %>% filter(mean_holdings >= 20, n_quarters >= 12))),
+  tibble(threshold = "≥30 holdings, ≥4yr", 
+         n = nrow(fund_metrics %>% filter(mean_holdings >= 30, n_quarters >= 16)))
+)
+```
+
+Recommendation: 
+
+Using 5 holdings and 2 years of history as the threshold would maximise sample size but include smaller/newer funds. Which is best for early-stage manager discovery and institutional investors that are more comfortable with higher volatility.
+
+```{r}
+fund_metrics_filtered <- fund_metrics %>% 
+  filter(
+    mean_holdings >= 5,
+    n_quarters >= 2*4
+  ) %>% 
+  arrange(desc(sharpe_ratio))
+
+top_5 <- fund_metrics_filtered %>% head(5)
+
+returns_by_fund %>% 
+  filter(cik %in% top_5$cik) %>% 
+  print(n = 50)
+
+holdext_clean %>% to_duckdb() %>% glimpse()
+```

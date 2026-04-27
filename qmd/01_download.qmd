@@ -1,0 +1,232 @@
+---
+title: "01_download"
+author: "Vinci Chan"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc_expand: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 1. Load Package
+
+```{r}
+library(data.table)
+library(lubridate)
+library(dplyr)
+library(DBI)
+library(RSQLite)
+library(future)
+library(furrr)
+
+source("R/config.R")
+source("R/utils_dates.R")
+source("R/utils_db.R")
+```
+
+# 2. Setup
+
+```{r}
+dates <- make_quarter_tbl(
+  start_year = cfg$start_year,
+  end_year = cfg$end_year
+)
+
+plan(multisession, workers = 3) # throttling for SEC request limit
+```
+
+# 3. Functions
+
+## 3.1. SEC master file
+
+```{r}
+qtr.master.file <- function(date){
+  # create URL of master index for that quarter
+  master.link <- paste0(
+    "https://www.sec.gov/Archives/edgar/full-index/", 
+    year(date), "/QTR", quarter(date), "/master.idx"
+  )
+
+  print(sprintf(
+    "Downloading master file for quarter %d of year %s...", 
+    quarter(date), year(date)
+  ))
+
+  # download master index into tmp.txt
+  tmp_path <- file.path(cfg$data_dir, "tmp.txt")
+
+  ok <- FALSE
+  for (attempt in 1:3) {
+    cat(sprintf(" Master attempt %d...\n", attempt))
+    res <- try(
+      download.file(
+        master.link,
+        tmp_path,
+        headers = c("User-Agent" = cfg$sec_user_agent),
+        mode = "wb",
+        quiet = TRUE
+      ),
+      silent = TRUE
+    )
+
+    if (!inherits(res, "try-error")) {
+      ok <- TRUE
+      break
+    }
+
+    cat("  Master download failed, waiting 30s before retry\n")
+    Sys.sleep(30)
+  }
+
+  if (!ok) {
+    stop("Failed to download master.idx for ", year(date), " Q", quarter(date))
+  }
+
+  # create master file for all 13F filings that quarter with links 
+  master <- tmp_path %>% 
+    readLines() %>% 
+    paste0(collapse = "\n") %>%
+    fread(sep = "|", skip = 11) %>%
+    `colnames<-`(c("cik", "name", "type", "date", "link")) %>% 
+    filter(grepl("^13F-HR(/A)?$", type)) %>%
+    mutate(link = paste0("https://www.sec.gov/Archives/", link)) %>% 
+    mutate(file = gsub(".*/", "", link))
+
+  closeAllConnections()
+  file.remove(tmp_path)
+  return(master)
+}
+```
+
+## 3.2. Download files into tmp dir
+
+```{r}
+dwnld.files <- function(master) {
+  dir.create(cfg$staging_dir, showWarnings = FALSE, recursive = TRUE)
+  master <- master %>% distinct(file, .keep_all = TRUE)
+
+  n_files <- nrow(master)
+
+  download_one <- function(idx) {
+    file_path <- file.path(cfg$staging_dir, master$file[idx])
+    success <- FALSE
+
+    for (attempt in 1:3) {
+      tryCatch(
+        {
+          download.file(
+            master$link[idx],
+            file_path,
+            quiet   = TRUE,
+            headers = c("User-Agent" = cfg$sec_user_agent),
+            mode    = "wb"
+          )
+          success <- TRUE
+          break
+        },
+        error = function(e) {
+          wait <- 5 * attempt   # 5s, 10s, 15s
+          cat(sprintf(
+            "\nFile %d/%d attempt %d failed, waiting %ds\n",
+            idx, n_files, attempt, wait
+          ))
+          Sys.sleep(wait)
+        }
+      )
+    }
+
+    # gentle per-file delay to avoid burstiness
+    Sys.sleep(0.3)
+
+    if (!success) {
+      cat(sprintf(
+        "\n*** Gave up on filing %d/%d: %s ***\n",
+        idx, n_files, master$file[idx]
+      ))
+    }
+
+    invisible(NULL)
+  }
+
+  cat("Starting parallel file downloads...\n")
+  future_walk(seq_len(n_files), download_one, .progress = TRUE)
+  cat("\nQuarter filings downloaded (a few may still be skipped)\n")
+}
+```
+
+## 3.3 Put all forms in SQdatabase
+
+```{r}
+put.files.in.sql <- function(dbname) {
+  together <- function(x) {
+    paste(x, collapse = "\n")
+  }
+
+  con <- dbConnect(SQLite(), dbname = dbname)
+  on.exit(dbDisconnect(con), add = TRUE)
+
+  if (dbExistsTable(con, "compsubm")) {
+    dbRemoveTable(con, "compsubm")
+  }
+  dbExecute(con, "CREATE TABLE compsubm (FILENAME TEXT, COMLSUBFILE TEXT)")
+
+  files <- list.files(cfg$staging_dir)
+  n <- length(files)
+  step <- 500
+
+  for (i in 1:(n %/% step + 1)) {
+    start <- 1 + (i - 1) * step
+    end <- i * step
+    ind <- start:min(end, n)
+
+    objects <- lapply(file.path(cfg$staging_dir, files[ind]), readLines)
+    clean <- lapply(objects, together)
+
+    data <- NULL
+    data$FILENAME <- files[ind]
+    data <- as.data.frame(data)
+    data$COMLSUBFILE <- unlist(clean)
+
+    dbWriteTable(con, "compsubm", data, append = TRUE)
+  }
+
+  unlink(cfg$staging_dir, recursive = TRUE)
+}
+```
+
+# 4. Run functions
+
+```{r}
+for (i in 1:nrow(dates)) {
+  cat(sprintf("\n=== Quarter %d/%d: %s ===\n", i, nrow(dates), dates$year_qtr[i]))
+
+  start_time <- Sys.time()
+  message(start_time)
+
+  master <- qtr.master.file(dates$date[i])
+
+  fwrite(
+    master,
+    file.path(cfg$master_index_dir, paste0("master_", dates$year_qtr[i], ".csv")),
+    row.names = FALSE
+  )
+
+  cat("Downloading", nrow(master), "files...\n")
+  dwnld.files(master)
+
+  cat("Loading to SQL...\n")
+  put.files.in.sql(sqlite_path(dates$year_qtr[i]))
+
+  end_time <- Sys.time()
+  elapsed <- end_time - start_time
+
+  message(
+    sprintf("Total time for %s: %.1f minutes (%.1f seconds)",
+            yq, as.numeric(elapsed, units = "mins"),
+            as.numeric(elapsed, units = "secs"))
+}
+```
