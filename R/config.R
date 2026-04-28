@@ -13,7 +13,7 @@ cfg <- list(
   end_year         = 2026,
   workers          = 5,
   timeout_sec      = 300,
-  sec_user_agent   = "vincichan2233@gmail.com"
+  sec_user_agent   = "wcchanvinci@gmail.com"
 )
 
 dir.create(cfg$data_dir,         recursive = TRUE, showWarnings = FALSE)
