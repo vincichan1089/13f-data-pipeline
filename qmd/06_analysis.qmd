@@ -128,7 +128,7 @@ compute_portfolio_weights <- function(holdings_data) {
     ungroup() %>%
     group_by(horizon_years, size_bucket, cohort, cik, cusip) %>%
     summarise(
-      value_weight = sum(value_weight, na.rm = TRUE),
+      value_weight = sum(value_weight, na.rm = TRUE), # for cusips with multiple entries
       .groups = "drop"
     )
 }
@@ -138,14 +138,18 @@ portfolio_vectors_to_matrices <- function(portfolio_vectors) {
     group_by(horizon_years, size_bucket, cohort) %>%
     nest() %>%
     mutate(
-      sim_input = map(data, ~ .x %>%
+      # 1. reshape to wide format
+      wide = map(data, ~
         pivot_wider(
+          .x,
           names_from = cusip,
           values_from = value_weight,
           values_fill = 0
-        )),
-      sim_matrix = map(sim_input, ~ {
-        mat <- .x %>% select(-cik) %>% as.matrix()
+        )
+      ),
+      # 2. turn each wide table into a matrix
+      sim_matrix = map(wide, ~ {
+        mat <- select(.x, -cik) %>% as.matrix()
         rownames(mat) <- .x$cik
         mat
       })
