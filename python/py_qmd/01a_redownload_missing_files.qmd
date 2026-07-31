@@ -1,0 +1,155 @@
+---
+title: "01a_redownload_missing_files"
+author: "Vinci Chan"
+date: today
+format:
+  html:
+    toc: true
+    toc_expand: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 1. Setup
+
+```{python}
+import shutil
+import sqlite3
+import time
+from pathlib import Path
+
+import pandas as pd
+import requests
+
+from py.config import cfg
+from py.utils_dates import make_quarter_tbl
+from py.utils_db import sqlite_path
+
+dates = make_quarter_tbl(
+    start_year=cfg.start_year,
+    end_year=cfg.end_year,
+)
+```
+
+# 2. Functions
+
+## 2.1 Identify missing files
+
+```{python}
+def find_missing_file(year_qtr: str) -> pd.DataFrame:
+    master_file_path = cfg.master_index_dir / f"master_{year_qtr}.csv"
+    sqlite_file_path = sqlite_path(year_qtr)
+
+    master = pd.read_csv(master_file_path, dtype=str)
+
+    con = sqlite3.connect(sqlite_file_path)
+    try:
+        db_files = pd.read_sql_query(
+            "SELECT DISTINCT FILENAME FROM compsubm",
+            con,
+        )
+    finally:
+        con.close()
+
+    missing = master.merge(
+        db_files,
+        how="left",
+        left_on="file",
+        right_on="FILENAME",
+        indicator=True,
+    )
+    missing = missing.loc[missing["_merge"] == "left_only", master.columns]
+    return missing.reset_index(drop=True)
+```
+
+## 2.2 Redownload missing files
+
+```{python}
+def dwnld_files(missing: pd.DataFrame) -> None:
+    cfg.staging_dir.mkdir(parents=True, exist_ok=True)
+    missing = missing.drop_duplicates(subset=["file"]).reset_index(drop=True)
+
+    n = len(missing)
+
+    for j, row in missing.iterrows():
+        file_path = cfg.staging_dir / row["file"]
+
+        success = False
+        for attempt in range(1, 4):
+            try:
+                response = requests.get(
+                    row["link"],
+                    headers={"User-Agent": cfg.sec_user_agent},
+                    timeout=cfg.timeout_sec,
+                )
+                response.raise_for_status()
+                file_path.write_bytes(response.content)
+                success = True
+                break
+            except requests.RequestException:
+                wait = 5 * attempt
+                print(f"\nFile {j + 1}/{n} attempt {attempt} failed, waiting {wait}s")
+                time.sleep(wait)
+
+        if not success:
+            print(f"\n*** Gave up on filing {j + 1}/{n}: {row['file']} ***")
+
+        time.sleep(0.13)
+
+    print("\nQuarter missing filings downloaded (a few may still be skipped)")
+```
+
+## 2.3 Add missing files to SQLite
+
+```{python}
+def put_files_in_sql(dbname: Path) -> None:
+    con = sqlite3.connect(dbname)
+
+    try:
+        files = sorted([p for p in cfg.staging_dir.iterdir() if p.is_file()]) if cfg.staging_dir.exists() else []
+
+        if len(files) == 0:
+            print("No files in staging_dir; nothing to add to SQLite")
+            shutil.rmtree(cfg.staging_dir, ignore_errors=True)
+            return
+
+        step = 500
+        for start in range(0, len(files), step):
+            batch_files = files[start : start + step]
+            rows = []
+
+            for f in batch_files:
+                rows.append((f.name, f.read_text(encoding="latin-1", errors="ignore")))
+
+            con.executemany(
+                "INSERT INTO compsubm (FILENAME, COMLSUBFILE) VALUES (?, ?)",
+                rows,
+            )
+            con.commit()
+    finally:
+        con.close()
+
+    shutil.rmtree(cfg.staging_dir, ignore_errors=True)
+```
+
+# 3. Loop over all quarters
+
+```{python}
+for i, row in dates.iterrows():
+    yq = row["year_qtr"]
+    print(f"\n=== Quarter {i + 1}/{len(dates)}: {yq} ===")
+
+    missing = find_missing_file(yq)
+
+    if len(missing) > 0:
+        print(f"Redownloading {len(missing)} missing filings for {yq}")
+        dwnld_files(missing)
+    else:
+        print(f"No missing filings for {yq}")
+
+    print("Loading to SQL...")
+    put_files_in_sql(sqlite_path(yq))
+    print("Missing filings loaded to SQL")
+```

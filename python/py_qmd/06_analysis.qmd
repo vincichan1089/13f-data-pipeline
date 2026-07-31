@@ -1,0 +1,316 @@
+---
+title: "06_analysis"
+author: "Vinci Chan"
+date: today
+format:
+  html:
+    toc: true
+    toc_expand: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 1. Setup
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from py.config import cfg
+from py.utils_dates import quarter_diff
+```
+
+# 2. Data Import
+
+```{python}
+clean_parts = sorted((cfg.derived_dir / "holdext_clean_parquet").glob("*.parquet"))
+holdext_clean = pd.concat([pd.read_parquet(p) for p in clean_parts], ignore_index=True)
+holdext_clean["rquarter"] = pd.to_datetime(holdext_clean["rquarter"], errors="coerce")
+```
+
+# 3. Functions
+
+```{python}
+def calculate_fund_returns(holdings_data: pd.DataFrame) -> pd.DataFrame:
+    out = (
+        holdings_data.groupby(["cik", "rquarter"], dropna=False)
+        .agg(total_value=("value", "sum"), n_holdings=("value", "size"))
+        .reset_index()
+        .sort_values(["cik", "rquarter"])
+    )
+    out["prev_value"] = out.groupby("cik")["total_value"].shift(1)
+    out["quarterly_return"] = (out["total_value"] - out["prev_value"]) / out["prev_value"]
+    return out
+
+
+def score_funds_by_horizon(returns_data: pd.DataFrame, horizon_quarters: int, latest_qtr: pd.Timestamp) -> pd.DataFrame:
+    out = returns_data.loc[returns_data["quarterly_return"].notna()].copy()
+    out["quarters_ago"] = out["rquarter"].apply(lambda d: quarter_diff(d, latest_qtr))
+    out = out.loc[out["quarters_ago"] <= horizon_quarters].copy()
+
+    rows = []
+    for cik, g in out.groupby("cik"):
+        if len(g) == horizon_quarters:
+            mean_r = g["quarterly_return"].mean()
+            sd_r = g["quarterly_return"].std()
+            sharpe = np.nan if (pd.isna(sd_r) or sd_r == 0) else mean_r / sd_r
+            rows.append(
+                {
+                    "cik": cik,
+                    "n_period": len(g),
+                    "mean_return": mean_r,
+                    "sd_return": sd_r,
+                    "sharpe_ratio": sharpe,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def assign_size_buckets(returns_data: pd.DataFrame, latest_qtr: pd.Timestamp, n_buckets: int = 4) -> pd.DataFrame:
+    out = returns_data.loc[returns_data["rquarter"] == latest_qtr, ["cik", "total_value"]].drop_duplicates().copy()
+    out["size_bucket"] = pd.qcut(out["total_value"], q=n_buckets, labels=[f"Q{i}" for i in range(1, n_buckets + 1)])
+    return out[["cik", "total_value", "size_bucket"]]
+
+
+def select_cohort_funds(scored_funds: pd.DataFrame, n_select: int = 10) -> pd.DataFrame:
+    sf = scored_funds.sort_values(["sharpe_ratio", "cik"]).reset_index(drop=True)
+
+    top_tbl = sf.sort_values(["sharpe_ratio", "cik"], ascending=[False, True]).head(n_select).assign(cohort="top")
+    bottom_tbl = sf.head(n_select).assign(cohort="bottom")
+
+    mid_start = int(np.floor((len(sf) - n_select) / 2))
+    middle_tbl = sf.iloc[mid_start : mid_start + n_select].assign(cohort="middle")
+
+    return pd.concat([top_tbl, bottom_tbl, middle_tbl], ignore_index=True)
+
+
+def get_holdings_at_period_start(holdings_data: pd.DataFrame, selected_funds_tbl: pd.DataFrame) -> pd.DataFrame:
+    sel = selected_funds_tbl[["horizon_years", "start_date", "size_bucket", "cohort", "cik"]].copy()
+    return holdings_data[["cik", "rquarter", "cusip", "value"]].merge(
+        sel,
+        how="inner",
+        left_on=["cik", "rquarter"],
+        right_on=["cik", "start_date"],
+    )
+
+
+def compute_portfolio_weights(holdings_data: pd.DataFrame) -> pd.DataFrame:
+    out = holdings_data.copy()
+    out["total_value"] = out.groupby(["horizon_years", "size_bucket", "cohort", "cik"]) ["value"].transform("sum")
+    out["value_weight"] = out["value"] / out["total_value"]
+
+    out = (
+        out.groupby(["horizon_years", "size_bucket", "cohort", "cik", "cusip"], dropna=False)["value_weight"]
+        .sum()
+        .reset_index()
+    )
+    return out
+
+
+def portfolio_vectors_to_matrices(portfolio_vectors: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for keys, g in portfolio_vectors.groupby(["horizon_years", "size_bucket", "cohort"]):
+        wide = g.pivot_table(index="cik", columns="cusip", values="value_weight", fill_value=0)
+        rows.append(
+            {
+                "horizon_years": keys[0],
+                "size_bucket": keys[1],
+                "cohort": keys[2],
+                "sim_matrix": wide,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def cosine_similarity_from_matrix(M: pd.DataFrame) -> pd.DataFrame:
+    mat = M.values
+    row_norms = np.sqrt((mat * mat).sum(axis=1))
+    row_norms[row_norms == 0] = np.nan
+    mat_norm = mat / row_norms[:, None]
+    sim = np.nan_to_num(mat_norm @ mat_norm.T)
+    return pd.DataFrame(sim, index=M.index, columns=M.index)
+
+
+def extract_unique_pairs(sim_matrix: pd.DataFrame) -> pd.DataFrame:
+    funds = sim_matrix.index.tolist()
+    rows = []
+    for i in range(len(funds)):
+        for j in range(i + 1, len(funds)):
+            f1 = funds[i]
+            f2 = funds[j]
+            rows.append(
+                {
+                    "fund_1": f1,
+                    "fund_2": f2,
+                    "cos_sim": sim_matrix.loc[f1, f2],
+                    "pair_key": f"{min(f1, f2)}_{max(f1, f2)}",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def get_extreme_pairs_by_cohort(cosine_sims: pd.DataFrame, time_horizons: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for _, r in cosine_sims.iterrows():
+        pairs = extract_unique_pairs(r["sim_matrix"])
+        if len(pairs) == 0:
+            continue
+
+        most = pairs.sort_values("cos_sim", ascending=False).head(1).assign(type="most")
+        least = pairs.sort_values("cos_sim", ascending=True).head(1).assign(type="least")
+        pair_tbl = pd.concat([most, least], ignore_index=True)
+
+        pair_tbl["horizon"] = r["horizon_years"]
+        pair_tbl["size_bucket"] = r["size_bucket"]
+        pair_tbl["cohort"] = r["cohort"]
+
+        rows.append(pair_tbl)
+
+    out = pd.concat(rows, ignore_index=True) if len(rows) else pd.DataFrame()
+    out = out.merge(
+        time_horizons[["horizon_years", "start_date"]],
+        left_on="horizon",
+        right_on="horizon_years",
+        how="left",
+    )
+    return out
+
+
+def get_pair_holdings_over_time(holdings_data: pd.DataFrame, pairs_table: pd.DataFrame) -> pd.DataFrame:
+    long_pairs = pairs_table.melt(
+        id_vars=["horizon", "size_bucket", "cohort", "type", "pair_key", "start_date"],
+        value_vars=["fund_1", "fund_2"],
+        var_name="fund_slot",
+        value_name="fund",
+    )
+
+    out = long_pairs.merge(
+        holdings_data[["cik", "rquarter", "cusip", "value", "shares"]],
+        left_on="fund",
+        right_on="cik",
+        how="left",
+    )
+    out = out.loc[out["rquarter"] >= out["start_date"]].copy()
+    return out
+
+
+def calculate_backtest_returns(backtest_holdings: pd.DataFrame) -> pd.DataFrame:
+    out = (
+        backtest_holdings.groupby(["horizon", "size_bucket", "cohort", "type", "pair_key", "rquarter"], dropna=False)
+        .agg(total_value_pair=("value", "sum"), n_holdings_pair=("value", "size"))
+        .reset_index()
+        .sort_values(["horizon", "size_bucket", "cohort", "type", "pair_key", "rquarter"])
+    )
+
+    out["prev_value_pair"] = out.groupby(["horizon", "size_bucket", "cohort", "type", "pair_key"]) ["total_value_pair"].shift(1)
+    out["quarterly_return"] = (out["total_value_pair"] - out["prev_value_pair"]) / out["prev_value_pair"]
+    return out
+
+
+def compute_backtest_statistics(backtest_returns: pd.DataFrame) -> pd.DataFrame:
+    out = backtest_returns.loc[backtest_returns["quarterly_return"].notna()].copy()
+
+    out = (
+        out.groupby(["horizon", "size_bucket", "cohort", "type", "pair_key"], dropna=False)["quarterly_return"]
+        .agg(n_period="size", mean_return="mean", sd_return="std")
+        .reset_index()
+    )
+    out["sharpe_ratio"] = out["mean_return"] / out["sd_return"]
+    out.loc[out["sd_return"] == 0, "sharpe_ratio"] = np.nan
+
+    return out.sort_values(["horizon", "size_bucket", "cohort", "type", "sharpe_ratio"], ascending=[True, True, True, True, False])
+```
+
+# 4. Orchestration
+
+```{python}
+returns_by_fund = calculate_fund_returns(holdext_clean)
+
+latest_rquarter = returns_by_fund["rquarter"].max()
+n_select = 10
+n_buckets = 4
+
+time_horizons = pd.DataFrame({"horizon_years": [2, 3, 4, 5]})
+time_horizons["quarters_back"] = time_horizons["horizon_years"] * 4
+time_horizons["start_date"] = time_horizons["quarters_back"].apply(lambda q: latest_rquarter - pd.DateOffset(months=q * 3))
+
+fund_sizes = assign_size_buckets(returns_by_fund, latest_rquarter, n_buckets=n_buckets)
+
+cohorts = []
+for _, hr in time_horizons.iterrows():
+    scored = score_funds_by_horizon(returns_by_fund, int(hr["quarters_back"]), latest_rquarter)
+    scored = scored.merge(fund_sizes, on="cik", how="inner")
+
+    for sb, g in scored.groupby("size_bucket"):
+        selected = select_cohort_funds(g, n_select=n_select)
+        selected["horizon_years"] = hr["horizon_years"]
+        selected["start_date"] = hr["start_date"]
+        cohorts.append(selected)
+
+fund_cohorts = pd.concat(cohorts, ignore_index=True)
+
+holdings_at_start = get_holdings_at_period_start(holdext_clean, fund_cohorts)
+portfolio_vectors = compute_portfolio_weights(holdings_at_start)
+portfolio_matrices = portfolio_vectors_to_matrices(portfolio_vectors)
+
+cosine_sims = portfolio_matrices.copy()
+cosine_sims["sim_matrix"] = cosine_sims["sim_matrix"].apply(cosine_similarity_from_matrix)
+
+extreme_pairs = get_extreme_pairs_by_cohort(cosine_sims, time_horizons)
+
+backtest_holdings = get_pair_holdings_over_time(holdext_clean, extreme_pairs)
+backtest_returns = calculate_backtest_returns(backtest_holdings)
+backtest_stats = compute_backtest_statistics(backtest_returns)
+```
+
+# 5. Results & Interpretation
+
+```{python}
+sharpe_wide = backtest_stats[["horizon", "size_bucket", "cohort", "type", "pair_key", "sharpe_ratio"]].pivot_table(
+    index=["horizon", "size_bucket", "cohort"],
+    columns="type",
+    values=["sharpe_ratio", "pair_key"],
+    aggfunc="first",
+).reset_index()
+
+sharpe_wide.columns = ["_".join([str(c) for c in col if c != ""]).strip("_") for col in sharpe_wide.columns.values]
+sharpe_wide["sharpe_diff"] = sharpe_wide["sharpe_ratio_most"] - sharpe_wide["sharpe_ratio_least"]
+
+plt.figure(figsize=(7, 4))
+plt.axhline(0, linestyle="--", color="grey")
+vals = [g["sharpe_diff"].dropna().values for _, g in sharpe_wide.groupby("horizon")]
+labels = [str(int(h)) for h in sorted(sharpe_wide["horizon"].dropna().unique())]
+plt.boxplot(vals, labels=labels)
+plt.xlabel("Horizon (years)")
+plt.ylabel("Sharpe(most) - Sharpe(least)")
+plt.title("Difference in Sharpe between most- and least-similar pairs")
+plt.tight_layout()
+
+overall = pd.DataFrame(
+    {
+        "n_cells": [len(sharpe_wide)],
+        "n_most_better": [(sharpe_wide["sharpe_diff"] > 0).sum()],
+        "n_least_better": [(sharpe_wide["sharpe_diff"] < 0).sum()],
+        "mean_diff": [sharpe_wide["sharpe_diff"].mean()],
+        "median_diff": [sharpe_wide["sharpe_diff"].median()],
+    }
+)
+overall
+
+by_horizon = (
+    sharpe_wide.groupby("horizon", dropna=False)
+    .agg(
+        n_cells=("sharpe_diff", "size"),
+        n_most_better=("sharpe_diff", lambda x: (x > 0).sum()),
+        mean_diff=("sharpe_diff", "mean"),
+    )
+    .reset_index()
+)
+by_horizon
+```
+
+Controlling for fund size and ex-ante performance cohort, there is no strong, consistent relationship between portfolio similarity and subsequent pair-level Sharpe ratios.

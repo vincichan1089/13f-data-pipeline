@@ -1,0 +1,85 @@
+---
+title: "04_combine"
+author: "Vinci Chan"
+date: today
+format:
+  html:
+    toc: true
+    toc_expand: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 1. Setup
+
+```{python}
+import sqlite3
+from pathlib import Path
+
+import pandas as pd
+
+from py.config import cfg
+```
+
+# 2. Get file paths
+
+```{python}
+sqlite_files = sorted(cfg.sqlite_dir.glob("*.sqlite"))
+
+len(sqlite_files), sqlite_files[:5]
+```
+
+# 3. Combine tables
+
+```{python}
+def quarter_date(year: int, qtr: int) -> pd.Timestamp:
+    mapping = {1: "02-15", 2: "05-15", 3: "08-15", 4: "11-15"}
+    return pd.Timestamp(f"{year}-{mapping[qtr]}")
+
+
+def read_quarter_holdings(sqlite_file: Path) -> pd.DataFrame:
+    yq = int(sqlite_file.stem)
+    year = yq // 10
+    qtr = yq % 10
+
+    if qtr not in [1, 2, 3, 4]:
+        return pd.DataFrame()
+
+    con = sqlite3.connect(sqlite_file)
+    try:
+        has_table = con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='holdings_table_parsed'"
+        ).fetchone()
+        if has_table is None:
+            return pd.DataFrame()
+
+        df = pd.read_sql_query("SELECT * FROM holdings_table_parsed", con)
+    finally:
+        con.close()
+
+    df["year_qtr"] = yq
+    df["year"] = year
+    df["qtr"] = qtr
+    df["quarter_label"] = f"{year} Q{qtr}"
+    df["quarter_date"] = quarter_date(year, qtr)
+
+    return df
+
+
+all_holdings_list = [read_quarter_holdings(p) for p in sqlite_files]
+all_holdings_list = [x for x in all_holdings_list if len(x) > 0]
+
+all_holdings = pd.concat(all_holdings_list, ignore_index=True) if all_holdings_list else pd.DataFrame()
+
+len(all_holdings), all_holdings["year_qtr"].nunique(), all_holdings["filename"].nunique()
+```
+
+```{python}
+all_holdings.to_parquet(cfg.derived_dir / "all_holdings.parquet", index=False)
+```
+
+```{python}
+all_holdings.groupby(["year_qtr", "quarter_label"], dropna=False).size().reset_index(name="n")
+```

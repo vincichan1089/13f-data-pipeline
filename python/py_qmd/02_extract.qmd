@@ -1,0 +1,300 @@
+---
+title: "02_extract"
+author: "Vinci Chan"
+date: today
+format:
+  html:
+    toc: true
+    toc_expand: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 1. Load Package
+
+```{python}
+import re
+import sqlite3
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import matplotlib.pyplot as plt
+import pandas as pd
+
+from py.config import cfg
+from py.utils_cusip import get_cusip_vec
+from py.utils_dates import make_quarter_tbl
+from py.utils_db import connect_sqlite, disconnect_sqlite
+```
+
+# 2. Setup
+
+```{python}
+dates = make_quarter_tbl(
+    start_year=1996,
+    end_year=cfg.end_year,
+    start_month_day="0701",
+)
+
+qa_dir_02 = cfg.qa_dir / "02"
+qa_dir_02.mkdir(parents=True, exist_ok=True)
+```
+
+# 3. Functions
+
+```{python}
+def get_header_value(lines: list[str], pattern: str) -> str | None:
+    out = [re.sub(pattern, "", ln.replace("\t", "")) for ln in lines if re.search(pattern, ln)]
+    return out[0] if len(out) > 0 else None
+
+
+def extract_bio(year_qtr: str) -> None:
+    con = connect_sqlite(year_qtr)
+
+    try:
+        compsubm_table = pd.read_sql_query("SELECT * FROM compsubm", con)
+
+        rows = []
+        for _, r in compsubm_table.iterrows():
+            lines = str(r["COMLSUBFILE"]).split("\n")
+            rows.append(
+                {
+                    "FILENAME": r["FILENAME"],
+                    "form": get_header_value(lines, r"CONFORMED SUBMISSION TYPE:"),
+                    "cik": get_header_value(lines, r"CENTRAL INDEX KEY:"),
+                    "cikname": get_header_value(lines, r"COMPANY CONFORMED NAME:"),
+                    "rdate": pd.to_datetime(get_header_value(lines, r"CONFORMED PERIOD OF REPORT:"), errors="coerce"),
+                    "fdate": pd.to_datetime(get_header_value(lines, r"FILED AS OF DATE:"), errors="coerce"),
+                }
+            )
+
+        header_table = pd.DataFrame(rows)
+        header_table.to_sql("header_table", con, if_exists="replace", index=False)
+    finally:
+        disconnect_sqlite(con)
+```
+
+```{python}
+def clean_block(
+    x: list[str],
+    use_cusip_join: bool,
+    cusip_vec: list[str],
+    cusip_vec_8: list[str],
+    cusip_vec_7: list[str],
+    error_rows: list[str],
+) -> list[str]:
+    x = [ln for ln in x if len(ln.strip()) > 0]
+
+    if use_cusip_join and len(cusip_vec) > 0:
+        has_cusip = []
+        for ln in x:
+            xx = re.sub(r"\s|-", "", ln)
+            n = len(xx)
+            ok = False
+
+            if n >= 9:
+                for s in range(0, n - 8):
+                    if xx[s : s + 9] in cusip_vec:
+                        ok = True
+                        break
+
+            if (not ok) and n >= 8:
+                for s in range(0, n - 7):
+                    if xx[s : s + 8] in cusip_vec_8:
+                        ok = True
+                        break
+
+            if (not ok) and n >= 7:
+                for s in range(0, n - 6):
+                    if xx[s : s + 7] in cusip_vec_7:
+                        ok = True
+                        break
+
+            has_cusip.append(ok)
+    else:
+        has_cusip = [bool(re.search(r"[0-9A-Z]{7,8}[0-9]?", re.sub(r"\s|-", "", ln), re.I)) for ln in x]
+
+    x = [ln for ln, keep in zip(x, has_cusip) if keep]
+
+    err_pat = re.compile("|".join(re.escape(e) for e in error_rows), re.I) if len(error_rows) else None
+    if err_pat is not None:
+        x = [ln for ln in x if not err_pat.search(ln)]
+
+    out = []
+    for ln in x:
+        num_chunks = re.findall(r"\d[\d,\.]*", ln)
+        if len(num_chunks) >= 3:
+            out.append(ln)
+
+    return out
+
+
+def make_holdings(
+    lines: list[str],
+    use_cusip_join: bool,
+    cusip_vec: list[str],
+    cusip_vec_8: list[str],
+    cusip_vec_7: list[str],
+    error_rows: list[str],
+) -> list[str]:
+    if all(len(ln.strip()) == 0 for ln in lines):
+        return []
+
+    info_start = [bool(re.search(r"<[^/]*informationTable", ln, re.I)) for ln in lines]
+    info_end = [bool(re.search(r"</[^>]*informationTable", ln, re.I)) for ln in lines]
+    if any(info_start) and any(info_end):
+        start = info_start.index(True)
+        end = len(lines) - 1 - info_end[::-1].index(True)
+        return lines[start : end + 1]
+
+    hold = []
+
+    table_start = [i for i, ln in enumerate(lines) if re.search(r"<TABLE>", ln, re.I)]
+    table_end = [i for i, ln in enumerate(lines) if re.search(r"</TABLE>", ln, re.I)]
+
+    if len(table_start) > 0 and len(table_end) > 0:
+        block_tbl = lines[table_start[0] : table_end[-1] + 1]
+        hold_tbl = clean_block(block_tbl, use_cusip_join, cusip_vec, cusip_vec_8, cusip_vec_7, error_rows)
+        if len(hold_tbl) > 0:
+            hold = hold_tbl
+
+    if len(hold) == 0:
+        idx_hdr = [i for i, ln in enumerate(lines) if re.search(r"</SEC-HEADER>", ln, re.I)]
+        start_fb = (max(idx_hdr) + 1) if len(idx_hdr) else 0
+        block_fb = lines[start_fb:]
+        hold = clean_block(block_fb, use_cusip_join, cusip_vec, cusip_vec_8, cusip_vec_7, error_rows)
+
+    return hold
+
+
+def extract_holdings(year_qtr: str) -> None:
+    con = connect_sqlite(year_qtr)
+
+    try:
+        yr = int(str(year_qtr)[:4])
+        use_cusip_join = yr >= 1996
+
+        cusip_vec = get_cusip_vec(con, year_qtr) if use_cusip_join else []
+        cusip_vec_8 = [x[:8] for x in cusip_vec] if len(cusip_vec) > 0 else []
+        cusip_vec_7 = [x[:7] for x in cusip_vec] if len(cusip_vec) > 0 else []
+
+        compsubm_table = pd.read_sql_query("SELECT * FROM compsubm", con)
+        compsubm_table["lines"] = compsubm_table["COMLSUBFILE"].fillna("").astype(str).str.split("\n")
+
+        error_rows = [
+            "<SEC-DOCUMENT>", "<SEC-HEADER>", "ACCESSION NUMBER:",
+            "<ACCEPTANCE-DATETIME>", "<FILENAME>", "<phone>", "Phone:",
+            "</additionalInformation>", "FORM 13F", "INFORMATION TABLE",
+            "SUMMARY PAGE", "RUN DATE", "PAGE",
+            "List of Other Managers", "SECURITIES AND EXCHANGE COMMISSION",
+            "ITEM ", "ITEM1", "ITEM 1:", "COL ", "COL1", "COLUMN", "Suite", "<DESCRIPTION>",
+        ]
+
+        use_parallel = int(year_qtr) < 20132
+        print("  Mode:", "parallel" if use_parallel else "sequential")
+
+        def run_one(lines: list[str]) -> list[str]:
+            return make_holdings(
+                lines,
+                use_cusip_join=use_cusip_join,
+                cusip_vec=cusip_vec,
+                cusip_vec_8=cusip_vec_8,
+                cusip_vec_7=cusip_vec_7,
+                error_rows=error_rows,
+            )
+
+        if use_parallel:
+            with ThreadPoolExecutor(max_workers=min(cfg.workers, 5)) as ex:
+                holding_lines = list(ex.map(run_one, compsubm_table["lines"].tolist()))
+        else:
+            holding_lines = [run_one(x) for x in compsubm_table["lines"].tolist()]
+
+        holdings_table_raw = pd.DataFrame(
+            {
+                "FILENAME": compsubm_table["FILENAME"],
+                "holding_text": ["\n".join(x) for x in holding_lines],
+            }
+        )
+
+        holdings_table_raw.to_sql("holdings_table_raw", con, if_exists="replace", index=False)
+    finally:
+        disconnect_sqlite(con)
+```
+
+# 4. Loop all functions
+
+```{python}
+for i, yq in enumerate(dates["year_qtr"].tolist(), start=1):
+    print(f"\n=== Quarter {i}/{len(dates)}: {yq} ===")
+
+    start_time = time.time()
+
+    print(f"Running extract_bio for {yq}...")
+    extract_bio(yq)
+    print(f"Finished extract_bio for {yq}")
+
+    print(f"Running extract_holdings for {yq}...")
+    extract_holdings(yq)
+    print(f"Finished extract_holdings for {yq}")
+
+    elapsed = time.time() - start_time
+    print(f"Total time for {yq}: {elapsed / 60:.1f} minutes ({elapsed:.1f} seconds)")
+```
+
+# 5. Extract summary
+
+```{python}
+def summarise_extract_quarter(year_qtr: str) -> pd.DataFrame:
+    con = connect_sqlite(year_qtr)
+
+    try:
+        has_table = con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='holdings_table_raw'"
+        ).fetchone()
+
+        if has_table is None:
+            return pd.DataFrame(
+                {
+                    "year_qtr": [year_qtr],
+                    "n_filings": [pd.NA],
+                    "n_empty": [pd.NA],
+                }
+            )
+
+        out = pd.read_sql_query("SELECT holding_text FROM holdings_table_raw", con)
+        return pd.DataFrame(
+            {
+                "year_qtr": [year_qtr],
+                "n_filings": [len(out)],
+                "n_empty": [(out["holding_text"] == "").sum()],
+            }
+        )
+    finally:
+        disconnect_sqlite(con)
+
+
+extract_summary = pd.concat([summarise_extract_quarter(yq) for yq in dates["year_qtr"].tolist()], ignore_index=True)
+extract_summary["pct_empty"] = extract_summary["n_empty"] / extract_summary["n_filings"]
+extract_summary.to_csv(qa_dir_02 / "extract_summary.csv", index=False)
+```
+
+```{python}
+plot_df = extract_summary.dropna(subset=["n_filings"]).copy()
+plot_df["year"] = plot_df["year_qtr"].str[:4].astype(int)
+plot_df["qtr"] = plot_df["year_qtr"].str[4].astype(int)
+plot_df["date"] = pd.PeriodIndex(plot_df["year"].astype(str) + "Q" + plot_df["qtr"].astype(str), freq="Q").to_timestamp()
+plot_df["pct_empty"] = plot_df["pct_empty"] * 100
+
+plt.figure(figsize=(8, 4))
+plt.plot(plot_df["date"], plot_df["pct_empty"], label="Empty filings (%)", color="steelblue")
+plt.scatter(plot_df["date"], plot_df["pct_empty"], s=8, color="steelblue")
+plt.plot(plot_df["date"], plot_df["n_filings"] / 100, label="Total filings (/100)", color="darkorange")
+plt.title("Extraction quality vs. number of 13F filings over time")
+plt.xlabel("Quarter")
+plt.legend(loc="lower center", ncol=2)
+plt.tight_layout()
+plt.savefig(qa_dir_02 / "extract_summary.png", dpi=300)
+plt.close()
+```

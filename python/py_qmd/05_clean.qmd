@@ -1,0 +1,408 @@
+---
+title: "05_clean"
+author: "Vinci Chan"
+date: today
+format:
+  html:
+    toc: true
+    toc_expand: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 1. Setup
+
+```{python}
+import shutil
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from py.config import cfg
+from py.utils_dates import make_quarter_tbl, quarter_end
+
+rquarters = make_quarter_tbl(
+    start_year=cfg.start_year,
+    end_year=2025,
+    start_month_day="0101",
+    end_month_day="1231",
+)
+
+rquarters["rquarter"] = rquarters["date"].apply(quarter_end)
+rquarters = rquarters.loc[rquarters["rquarter"] >= pd.Timestamp("1999-01-01")][["rquarter"]].drop_duplicates().sort_values("rquarter")
+
+qa_dir_05 = cfg.qa_dir / "05"
+qa_dir_05.mkdir(parents=True, exist_ok=True)
+```
+
+# 2. Functions
+
+```{python}
+def build_holdext_raw() -> pd.DataFrame:
+    all_path = cfg.derived_dir / "all_holdings.parquet"
+    extract_path = cfg.derived_dir / "holdext_raw_parquet.parquet"
+
+    if not extract_path.exists():
+        all_holdings = pd.read_parquet(all_path)
+
+        key_cols = [
+            "nameOfIssuer",
+            "titleOfClass",
+            "cusip",
+            "value",
+            "shrsOrPrnAmt",
+            "investmentDiscretion",
+            "votingAuthority",
+            "shares",
+        ]
+
+        mask_empty = all_holdings[key_cols].isna().all(axis=1)
+        out = all_holdings.loc[~mask_empty, [
+            "filename",
+            "cik",
+            "cikname",
+            "rdate",
+            "fdate",
+            "nameOfIssuer",
+            "cusip",
+            "value",
+            "shares",
+        ]].copy()
+
+        out.to_parquet(extract_path, index=False)
+
+    return pd.read_parquet(extract_path)
+
+
+def clean_dates(holdext_raw: pd.DataFrame) -> pd.DataFrame:
+    out = holdext_raw.copy()
+
+    out["rdate"] = pd.to_datetime(out["rdate"], errors="coerce")
+    out["fdate"] = pd.to_datetime(out["fdate"], errors="coerce")
+
+    fixes = {
+        "0000080255-03-000400.txt": pd.Timestamp("2002-12-31"),
+        "0000905148-07-001531.txt": pd.Timestamp("2006-09-30"),
+        "0001103882-11-000001.txt": pd.Timestamp("2010-09-30"),
+    }
+
+    out["rdate"] = out.apply(
+        lambda r: fixes.get(r["filename"], r["rdate"]),
+        axis=1,
+    )
+
+    same_date = out["rdate"] == out["fdate"]
+    out.loc[same_date, "rdate"] = out.loc[same_date, "fdate"].apply(
+        lambda d: d.to_period("Q").start_time - pd.Timedelta(days=1)
+    )
+
+    out["rquarter"] = out["rdate"].apply(quarter_end)
+    out = out.loc[out["rquarter"] >= pd.Timestamp("1999-01-01")].copy()
+
+    return out
+
+
+def select_canonical_filings(holdext_raw: pd.DataFrame) -> pd.DataFrame:
+    base = (
+        holdext_raw.groupby(["cik", "rquarter", "filename"], dropna=False)
+        .agg(n_holdings=("filename", "size"), fdate=("fdate", "max"))
+        .reset_index()
+    )
+
+    base["max_n"] = base.groupby(["cik", "rquarter"], dropna=False)["n_holdings"].transform("max")
+    cand = base.loc[base["n_holdings"] == base["max_n"]].copy()
+
+    cand = cand.sort_values(["cik", "rquarter", "fdate"]).groupby(["cik", "rquarter"], dropna=False).tail(1)
+
+    keep = cand[["cik", "rquarter", "filename"]].copy()
+
+    out = holdext_raw.merge(keep, on=["cik", "rquarter", "filename"], how="inner")
+    return out
+
+
+def clean_cusip(holdext_raw: pd.DataFrame) -> pd.DataFrame:
+    out = holdext_raw.copy()
+    out["cusip"] = out["cusip"].astype(str).str.strip().str.upper()
+    out["cusip_len"] = out["cusip"].str.len()
+    out = out.loc[out["cusip_len"] >= 7].drop(columns=["cusip_len"]).copy()
+    return out
+
+
+def filter_outliers(holdext_raw: pd.DataFrame) -> pd.DataFrame:
+    value_cap = holdext_raw["value"].quantile(0.999)
+    shares_cap = holdext_raw["shares"].quantile(0.999)
+
+    return holdext_raw.loc[
+        (holdext_raw["value"].isna() | (holdext_raw["value"] <= value_cap))
+        & (holdext_raw["shares"].isna() | (holdext_raw["shares"] <= shares_cap))
+    ].copy()
+
+
+def detect_unit_switches(holdext_raw: pd.DataFrame) -> pd.DataFrame:
+    conversion_date = pd.Timestamp("2023-01-03")
+
+    value_panel = (
+        holdext_raw.groupby(["cik", "rquarter"], dropna=False)
+        .agg(
+            fdate=("fdate", "max"),
+            portfolio_value=("value", "sum"),
+            holdings_count=("value", "size"),
+        )
+        .reset_index()
+        .sort_values(["cik", "rquarter"])
+    )
+
+    value_panel["first_fdate"] = value_panel.groupby("cik")["fdate"].transform("min")
+    value_panel["initial_state"] = (value_panel["first_fdate"] >= conversion_date).astype(int)
+
+    value_panel["lag_value"] = value_panel.groupby("cik")["portfolio_value"].shift(1)
+    value_panel["lag_holdings"] = value_panel.groupby("cik")["holdings_count"].shift(1)
+
+    value_panel["value_ratio"] = np.where(
+        (value_panel["lag_value"].notna()) & (value_panel["lag_value"] > 0),
+        value_panel["portfolio_value"] / value_panel["lag_value"],
+        np.nan,
+    )
+    value_panel["holdings_ratio"] = np.where(
+        (value_panel["lag_holdings"].notna()) & (value_panel["lag_holdings"] > 0),
+        value_panel["holdings_count"] / value_panel["lag_holdings"],
+        np.nan,
+    )
+
+    cand = value_panel.loc[
+        value_panel["value_ratio"].notna()
+        & (value_panel["holdings_ratio"].isna() | (value_panel["holdings_ratio"] < 5))
+    ].copy()
+    cand = cand.sort_values(["cik", "value_ratio"], ascending=[True, False]).groupby("cik").head(1)
+    cand["switch_on_event"] = cand["value_ratio"] > 50
+
+    flags = value_panel.merge(
+        cand[["cik", "rquarter", "switch_on_event"]],
+        on=["cik", "rquarter"],
+        how="left",
+    )
+    flags["switch_on_event"] = flags["switch_on_event"].fillna(False)
+    flags["event"] = flags["switch_on_event"].astype(int)
+    flags["unit_state"] = flags["initial_state"] + flags.groupby("cik")["event"].cumsum()
+    flags["unit_state"] = flags["unit_state"].clip(0, 1).astype(int)
+    flags["fallback"] = flags.groupby("cik")["portfolio_value"].transform(lambda s: (s >= 1e8).cumsum() > 0)
+    flags["scale_down_flag"] = (flags["unit_state"] == 1) | flags["fallback"]
+
+    out = holdext_raw.merge(
+        flags[["cik", "rquarter", "value_ratio", "holdings_ratio", "scale_down_flag"]],
+        on=["cik", "rquarter"],
+        how="left",
+    )
+    out["scale_down_flag"] = out["scale_down_flag"].fillna(False)
+    out["value"] = np.where(out["scale_down_flag"], out["value"] / 1000, out["value"])
+
+    return out[[
+        "filename",
+        "cik",
+        "cikname",
+        "rdate",
+        "rquarter",
+        "fdate",
+        "nameOfIssuer",
+        "cusip",
+        "value",
+        "shares",
+    ]].copy()
+
+
+def build_missing_quarters_batch(batch_df: pd.DataFrame) -> pd.DataFrame:
+    holding_cols = ["nameOfIssuer", "cusip", "value", "shares"]
+
+    cik_ranges = (
+        batch_df[["cik", "rquarter"]]
+        .drop_duplicates()
+        .groupby("cik", as_index=False)
+        .agg(min_rquarter=("rquarter", "min"), max_rquarter=("rquarter", "max"))
+    )
+
+    grid = cik_ranges.merge(rquarters.assign(key=1), how="cross").drop(columns=["key"])
+    grid = grid.loc[(grid["rquarter"] >= grid["min_rquarter"]) & (grid["rquarter"] <= grid["max_rquarter"]), ["cik", "rquarter"]]
+
+    filled = grid.merge(batch_df, on=["cik", "rquarter"], how="left")
+
+    is_empty = filled[holding_cols].isna().all(axis=1)
+    filled["missing_quarter"] = np.where(is_empty, 1, 0)
+
+    filled = filled.sort_values(["cik", "rquarter"]).copy()
+    filled["own_rquarter"] = np.where(filled["missing_quarter"] == 0, filled["rquarter"], pd.NaT)
+    filled["prior_rquarter"] = filled.groupby("cik")["own_rquarter"].ffill()
+
+    real_holdings = filled.loc[filled["missing_quarter"] == 0].copy()
+    core_cols = [
+        "filename",
+        "cik",
+        "cikname",
+        "rdate",
+        "rquarter",
+        "fdate",
+        "nameOfIssuer",
+        "cusip",
+        "value",
+        "shares",
+    ]
+
+    real_holdings = real_holdings[core_cols].copy()
+
+    locf_rows = filled.loc[filled["missing_quarter"] == 1, ["cik", "rquarter", "prior_rquarter"]].copy()
+    source = real_holdings.rename(columns={"rquarter": "prior_rquarter"})
+
+    locf = locf_rows.merge(source, on=["cik", "prior_rquarter"], how="left")
+    locf = locf.rename(columns={"rquarter": "rquarter_new"})
+    locf["rquarter"] = locf["rquarter_new"]
+    locf = locf[core_cols].copy()
+
+    out = pd.concat([real_holdings, locf], ignore_index=True)
+    return out
+```
+
+# 3. Orchestration
+
+```{python}
+stage0 = build_holdext_raw()
+
+stage1 = (
+    stage0.pipe(clean_dates)
+    .pipe(select_canonical_filings)
+    .pipe(clean_cusip)
+    .pipe(filter_outliers)
+    .pipe(detect_unit_switches)
+)
+
+stage2_path = cfg.staging_dir / "holdext_raw_stage2_parquet"
+if stage2_path.exists():
+    shutil.rmtree(stage2_path)
+stage2_path.mkdir(parents=True, exist_ok=True)
+
+cik_batch = (
+    stage1[["cik"]]
+    .drop_duplicates()
+    .sort_values("cik")
+    .reset_index(drop=True)
+)
+cik_batch["batch_id"] = [f"batch_{((i // 500) + 1):04d}" for i in range(len(cik_batch))]
+
+stage2 = stage1.merge(cik_batch, on="cik", how="left")
+for b, g in stage2.groupby("batch_id"):
+    g.to_parquet(stage2_path / f"{b}.parquet", index=False)
+
+stage3_path = cfg.derived_dir / "holdext_clean_parquet"
+if stage3_path.exists():
+    shutil.rmtree(stage3_path)
+stage3_path.mkdir(parents=True, exist_ok=True)
+
+for b in sorted(cik_batch["batch_id"].unique()):
+    batch_df = pd.read_parquet(stage2_path / f"{b}.parquet").drop(columns=["batch_id"])
+    holdext_clean_batch = build_missing_quarters_batch(batch_df)
+    holdext_clean_batch.to_parquet(stage3_path / f"{b}.parquet", index=False)
+
+holdext_clean = pd.concat([pd.read_parquet(p) for p in sorted(stage3_path.glob("*.parquet"))], ignore_index=True)
+```
+
+# 4. Check and clean up
+
+```{python}
+gaps = (
+    holdext_clean[["cik", "rquarter"]]
+    .drop_duplicates()
+    .sort_values(["cik", "rquarter"])
+    .copy()
+)
+
+gaps["expected_next"] = gaps.groupby("cik")["rquarter"].shift(0).apply(lambda d: (pd.Timestamp(d) + pd.offsets.QuarterEnd(1)) if pd.notna(d) else pd.NaT)
+gaps["actual_next"] = gaps.groupby("cik")["rquarter"].shift(-1)
+gaps["has_gap"] = gaps["actual_next"].notna() & (gaps["actual_next"] != gaps["expected_next"])
+
+n_gaps = int(gaps["has_gap"].sum())
+if n_gaps == 0:
+    shutil.rmtree(stage2_path, ignore_errors=True)
+```
+
+# 5. QA
+
+```{python}
+holdext_raw = pd.read_parquet(cfg.derived_dir / "holdext_raw_parquet.parquet")
+holdext_clean = pd.concat([pd.read_parquet(p) for p in sorted((cfg.derived_dir / "holdext_clean_parquet").glob("*.parquet"))], ignore_index=True)
+```
+
+```{python}
+raw_map = holdext_raw[["cik", "rdate"]].copy()
+raw_map["rdate"] = pd.to_datetime(raw_map["rdate"], errors="coerce")
+raw_map["rquarter"] = raw_map["rdate"].apply(quarter_end)
+
+quarter_cmp = (
+    raw_map[["cik", "rquarter"]]
+    .drop_duplicates()
+    .groupby("cik")
+    .size()
+    .reset_index(name="raw_n_q")
+    .merge(
+        holdext_clean[["cik", "rquarter"]]
+        .drop_duplicates()
+        .groupby("cik")
+        .size()
+        .reset_index(name="clean_n_q"),
+        on="cik",
+        how="outer",
+    )
+    .fillna(0)
+)
+quarter_cmp["diff_q"] = quarter_cmp["clean_n_q"] - quarter_cmp["raw_n_q"]
+
+plt.figure(figsize=(8, 5))
+xymax = max(quarter_cmp["raw_n_q"].max(), quarter_cmp["clean_n_q"].max())
+plt.plot([0, xymax], [0, xymax], linestyle="--", color="grey")
+sc = plt.scatter(quarter_cmp["raw_n_q"], quarter_cmp["clean_n_q"], c=quarter_cmp["diff_q"], s=10, alpha=0.6)
+plt.colorbar(sc, label="Clean - raw")
+plt.title("Number of rquarters per CIK: holdext_raw vs holdext_clean")
+plt.xlabel("Raw number of rquarters")
+plt.ylabel("Clean number of rquarters")
+plt.tight_layout()
+plt.savefig(qa_dir_05 / "qa_quarters_raw_vs_clean.png", dpi=300)
+plt.close()
+```
+
+```{python}
+example_cik = "0000002230"
+
+raw_series = holdext_raw.copy()
+raw_series["rdate"] = pd.to_datetime(raw_series["rdate"], errors="coerce")
+raw_series["rquarter"] = raw_series["rdate"].apply(quarter_end)
+raw_series = (
+    raw_series.loc[raw_series["cik"] == example_cik]
+    .groupby(["cik", "rquarter"], dropna=False)["value"]
+    .sum()
+    .reset_index(name="raw_portfolio_value")
+)
+
+clean_series = (
+    holdext_clean.loc[holdext_clean["cik"] == example_cik]
+    .groupby(["cik", "rquarter"], dropna=False)["value"]
+    .sum()
+    .reset_index(name="clean_portfolio_value")
+)
+
+both = raw_series.merge(clean_series, on=["cik", "rquarter"], how="inner")
+both["raw_b"] = both["raw_portfolio_value"] / 1e9
+both["clean_b"] = both["clean_portfolio_value"] / 1e9
+
+plt.figure(figsize=(7, 4.5))
+plt.plot(both["rquarter"], both["raw_b"], label="Raw")
+plt.scatter(both["rquarter"], both["raw_b"], s=10)
+plt.plot(both["rquarter"], both["clean_b"], label="Clean")
+plt.scatter(both["rquarter"], both["clean_b"], s=10)
+plt.title(f"Raw vs clean portfolio value for CIK {example_cik}")
+plt.ylabel("Portfolio value (billions USD)")
+plt.legend()
+plt.tight_layout()
+plt.savefig(qa_dir_05 / "qa_value_raw_vs_clean_example_cik.png", dpi=300)
+plt.close()
+```

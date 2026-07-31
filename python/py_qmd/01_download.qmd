@@ -1,0 +1,211 @@
+---
+title: "01_download"
+author: "Vinci Chan"
+date: today
+format:
+  html:
+    toc: true
+    toc_expand: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 1. Load Package
+
+```{python}
+import io
+import shutil
+import sqlite3
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+
+import pandas as pd
+import requests
+
+from py.config import cfg
+from py.utils_dates import make_quarter_tbl
+from py.utils_db import sqlite_path
+```
+
+# 2. Setup
+
+```{python}
+dates = make_quarter_tbl(
+    start_year=cfg.start_year,
+    end_year=cfg.end_year,
+)
+
+workers = 3  # throttling for SEC request limit
+```
+
+# 3. Functions
+
+## 3.1 SEC master file
+
+```{python}
+def qtr_master_file(date: pd.Timestamp) -> pd.DataFrame:
+    qtr = int(date.quarter)
+    yr = int(date.year)
+
+    master_link = (
+        f"https://www.sec.gov/Archives/edgar/full-index/{yr}/QTR{qtr}/master.idx"
+    )
+
+    print(f"Downloading master file for quarter {qtr} of year {yr}...")
+
+    tmp_path = cfg.data_dir / "tmp.txt"
+
+    ok = False
+    for attempt in range(1, 4):
+        print(f" Master attempt {attempt}...")
+        try:
+            response = requests.get(
+                master_link,
+                headers={"User-Agent": cfg.sec_user_agent},
+                timeout=cfg.timeout_sec,
+            )
+            response.raise_for_status()
+            tmp_path.write_bytes(response.content)
+            ok = True
+            break
+        except requests.RequestException:
+            print("  Master download failed, waiting 30s before retry")
+            time.sleep(30)
+
+    if not ok:
+        raise RuntimeError(f"Failed to download master.idx for {yr} Q{qtr}")
+
+    lines = tmp_path.read_text(encoding="latin-1", errors="ignore").splitlines()
+    content = "\n".join(lines[11:])
+
+    master = pd.read_csv(
+        io.StringIO(content),
+        sep="|",
+        header=None,
+        names=["cik", "name", "type", "date", "link"],
+        dtype=str,
+    )
+
+    master = master.loc[
+        master["type"].str.match(r"^13F-HR(/A)?$", na=False)
+    ].copy()
+    master["link"] = "https://www.sec.gov/Archives/" + master["link"]
+    master["file"] = master["link"].str.rsplit("/", n=1).str[-1]
+
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    return master.reset_index(drop=True)
+```
+
+## 3.2 Download files into staging dir
+
+```{python}
+def dwnld_files(master: pd.DataFrame) -> None:
+    cfg.staging_dir.mkdir(parents=True, exist_ok=True)
+    master = master.drop_duplicates(subset=["file"]).reset_index(drop=True)
+
+    n_files = len(master)
+
+    def download_one(item: tuple[int, pd.Series]) -> None:
+        idx, row = item
+        file_path = cfg.staging_dir / row["file"]
+        success = False
+
+        for attempt in range(1, 4):
+            try:
+                response = requests.get(
+                    row["link"],
+                    headers={"User-Agent": cfg.sec_user_agent},
+                    timeout=cfg.timeout_sec,
+                )
+                response.raise_for_status()
+                file_path.write_bytes(response.content)
+                success = True
+                break
+            except requests.RequestException:
+                wait = 5 * attempt
+                print(
+                    f"\nFile {idx + 1}/{n_files} attempt {attempt} failed, waiting {wait}s"
+                )
+                time.sleep(wait)
+
+        time.sleep(0.3)
+
+        if not success:
+            print(f"\n*** Gave up on filing {idx + 1}/{n_files}: {row['file']} ***")
+
+    print("Starting parallel file downloads...")
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        list(executor.map(download_one, master.iterrows()))
+
+    print("\nQuarter filings downloaded (a few may still be skipped)")
+```
+
+## 3.3 Put all forms in SQLite database
+
+```{python}
+def put_files_in_sql(dbname) -> None:
+    conn = sqlite3.connect(dbname)
+
+    try:
+        cur = conn.cursor()
+        cur.execute("DROP TABLE IF EXISTS compsubm")
+        cur.execute("CREATE TABLE compsubm (FILENAME TEXT, COMLSUBFILE TEXT)")
+
+        files = sorted([p for p in cfg.staging_dir.iterdir() if p.is_file()])
+        step = 500
+
+        for start in range(0, len(files), step):
+            batch_files = files[start : start + step]
+            rows = []
+
+            for f in batch_files:
+                content = f.read_text(encoding="latin-1", errors="ignore")
+                rows.append((f.name, content))
+
+            cur.executemany(
+                "INSERT INTO compsubm (FILENAME, COMLSUBFILE) VALUES (?, ?)",
+                rows,
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+    shutil.rmtree(cfg.staging_dir, ignore_errors=True)
+```
+
+# 4. Run functions
+
+```{python}
+for i, row in dates.iterrows():
+    yq = row["year_qtr"]
+    print(f"\n=== Quarter {i + 1}/{len(dates)}: {yq} ===")
+
+    start_time = datetime.now()
+    print(start_time)
+
+    master = qtr_master_file(row["date"])
+
+    master.to_csv(
+        cfg.master_index_dir / f"master_{yq}.csv",
+        index=False,
+    )
+
+    print(f"Downloading {len(master)} files...")
+    dwnld_files(master)
+
+    print("Loading to SQL...")
+    put_files_in_sql(sqlite_path(yq))
+
+    end_time = datetime.now()
+    elapsed = end_time - start_time
+
+    print(
+        f"Total time for {yq}: {elapsed.total_seconds() / 60:.1f} minutes "
+        f"({elapsed.total_seconds():.1f} seconds)"
+    )
+```

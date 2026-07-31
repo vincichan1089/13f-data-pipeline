@@ -1,0 +1,541 @@
+---
+title: "03_parse"
+author: "Vinci Chan"
+date: today
+format:
+  html:
+    toc: true
+    toc_expand: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 1. Load Package
+
+```{python}
+import io
+import re
+import sqlite3
+import time
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from py.config import cfg
+from py.utils_cusip import get_cusip_vec
+from py.utils_dates import make_quarter_tbl
+from py.utils_db import connect_sqlite, disconnect_sqlite
+```
+
+# 2. Setup
+
+```{python}
+dates = make_quarter_tbl(
+    start_year=1996,
+    end_year=cfg.end_year,
+)
+
+qa_dir_03 = cfg.qa_dir / "03"
+qa_dir_03.mkdir(parents=True, exist_ok=True)
+```
+
+# 3. Functions
+
+```{python}
+def determine_type(table_text: str, numseps: int = 3, minspace: int = 3, min_frac: float = 0.5) -> str:
+    table = table_text.split("\n")
+
+    if len(table) == 0 or all(len(x.strip()) == 0 for x in table):
+        return "none"
+
+    if any(re.search(r"<[^/]*informationTable|</[^>]*informationTable", ln, re.I) for ln in table):
+        return "xml"
+
+    n = len(table)
+
+    tabseps = sum((ln.count("\t") >= numseps) for ln in table) / n
+    comseps = sum((ln.count(",") >= numseps) for ln in table) / n
+
+    spaceseps = 0
+    for ln in table:
+        matches = re.finditer(r"[A-Za-z0-9]\s+", ln)
+        max_len = max([len(m.group(0)) - 1 for m in matches], default=0)
+        if max_len >= minspace:
+            spaceseps += 1
+    spaceseps = spaceseps / n
+
+    scores = {"tab": tabseps, "csv": comseps, "fwf": spaceseps}
+    best = max(scores, key=scores.get)
+
+    if scores[best] < min_frac:
+        return "csv"
+
+    return best
+
+
+def regmatches_multiple(pattern: list[str], x: list[str], n: int, min_digits: int = 6, max_digits: int = 9):
+    groups = [pattern[i : i + n] for i in range(0, len(pattern), n)]
+
+    starts = [None] * len(x)
+    ends = [None] * len(x)
+
+    for grp in groups:
+        rx = re.compile("|".join(re.escape(p) for p in grp), re.I)
+        for i, ln in enumerate(x):
+            m = rx.search(ln)
+            if m is not None:
+                s, e = m.start(), m.end()
+                if starts[i] is None or s < starts[i]:
+                    starts[i], ends[i] = s, e
+
+    out_match = []
+    out_start = []
+    out_end = []
+
+    cusip_regex = re.compile(rf"^([A-Za-z0-9][ -]*){{{min_digits - 1},{max_digits - 1}}}[A-Za-z0-9]")
+
+    for ln, s, e in zip(x, starts, ends):
+        if s is None:
+            out_match.append(None)
+            out_start.append(None)
+            out_end.append(None)
+            continue
+
+        tail = ln[s:]
+        m2 = cusip_regex.search(tail)
+
+        if m2 is None:
+            out_match.append(None)
+            out_start.append(s)
+            out_end.append(None)
+            continue
+
+        span = m2.group(0)
+        cleaned = re.sub(r"[\s-]", "", span)
+        if len(cleaned) < min_digits or len(cleaned) > max_digits:
+            cleaned = None
+
+        out_match.append(cleaned)
+        out_start.append(s)
+        out_end.append(s + len(span))
+
+    return {
+        "match": out_match,
+        "start": out_start,
+        "end": out_end,
+    }
+
+
+def cusip_remainder(table: list[str], cusip_list: list[str]) -> pd.DataFrame:
+    cusip_key = sorted(set([c[:6].upper() for c in cusip_list if isinstance(c, str) and len(c) >= 6]))
+    out = regmatches_multiple(cusip_key, table, max(1, 100), max_digits=9)
+
+    cusip9 = [x.upper() if isinstance(x, str) else None for x in out["match"]]
+    ends = out["end"]
+
+    shrs = []
+    put_call = []
+    inv_disc = []
+    remainders = []
+
+    cut_words = [
+        "SH", "PRN", "PRIN", "CALL", "PUT", "SOLE", "OTHER", "OTR", "OTH", "DEFINED", "DFND", "DEF", "SHARED", "YES",
+    ]
+    cut_rx = re.compile(rf"(^|[^A-Za-z])({'|'.join(cut_words)})([^A-Za-z]|$)", re.I)
+
+    for ln, end in zip(table, ends):
+        if end is None:
+            tail = ""
+            rem = ""
+        else:
+            tail = ln[end:]
+            m = cut_rx.search(tail)
+            if m is None:
+                rem = ln[end:]
+            else:
+                rem = ln[end : end + m.start()]
+
+        if re.search(r"SH", tail, re.I):
+            sh = "SH"
+        elif re.search(r"PRN|PRIN", tail, re.I):
+            sh = "PRN"
+        else:
+            sh = None
+
+        if re.search(r"PUT", tail, re.I):
+            pc = "PUT"
+        elif re.search(r"CALL", tail, re.I):
+            pc = "CALL"
+        else:
+            pc = None
+
+        if re.search(r"SOLE", tail, re.I):
+            idisc = "SOLE"
+        elif re.search(r"OTHER|OTR|OTH", tail, re.I):
+            idisc = "OTR"
+        elif re.search(r"DEFINED|DFND|DEF", tail, re.I):
+            idisc = "DFND"
+        elif re.search(r"SHARED", tail, re.I):
+            idisc = "SHARED"
+        else:
+            idisc = None
+
+        shrs.append(sh)
+        put_call.append(pc)
+        inv_disc.append(idisc)
+        remainders.append(rem)
+
+    return pd.DataFrame(
+        {
+            "cusip9": cusip9,
+            "cusip8": [x[:8] if isinstance(x, str) else None for x in cusip9],
+            "shrsOrPrnAmt": shrs,
+            "putCall": put_call,
+            "investmentDiscretion": inv_disc,
+            "remainder": remainders,
+        }
+    )
+
+
+def separate_remainder(rows: list[str], regex: str = r"(\d+|\d{1,3}(,\d{3})*)(\.\d*)?") -> pd.DataFrame:
+    out = []
+    for row in rows:
+        nums = re.findall(regex, row or "")
+        vals = []
+        for m in nums:
+            raw = m[0] if isinstance(m, tuple) else m
+            try:
+                vals.append(float(raw.replace(",", "")))
+            except ValueError:
+                continue
+        out.append(vals)
+
+    max_len = max((len(x) for x in out), default=0)
+    data = {}
+    for i in range(max_len):
+        data[f"num{i + 1}"] = [vals[i] if i < len(vals) else np.nan for vals in out]
+
+    return pd.DataFrame(data)
+
+
+def parse_others(table: list[str], cusip_list: list[str]) -> pd.DataFrame:
+    data = cusip_remainder(table, cusip_list)
+    numbers = separate_remainder(data["remainder"].tolist())
+    data = pd.concat([data.reset_index(drop=True), numbers.reset_index(drop=True)], axis=1)
+
+    num_cols = [c for c in data.columns if c.startswith("num")]
+
+    if len(num_cols) == 0:
+        value_col = [np.nan] * len(data)
+        shares_col = [np.nan] * len(data)
+    elif len(num_cols) == 1:
+        value_col = [np.nan] * len(data)
+        shares_col = data[num_cols[0]].tolist()
+    else:
+        value_col = data[num_cols[0]].tolist()
+        shares_col = data[num_cols[1]].tolist()
+
+    return pd.DataFrame(
+        {
+            "nameOfIssuer": [None] * len(data),
+            "titleOfClass": [None] * len(data),
+            "cusip": data["cusip9"],
+            "value": value_col,
+            "shrsOrPrnAmt": data["shrsOrPrnAmt"],
+            "investmentDiscretion": data["investmentDiscretion"],
+            "votingAuthority": [None] * len(data),
+            "shares": shares_col,
+        }
+    )
+
+
+def parse_xml(table: list[str], cusip_list: list[str]) -> pd.DataFrame:
+    info_start = next((i for i, x in enumerate(table) if re.search(r"^\s*<([A-Za-z0-9_]+:)?informationTable\b", x)), None)
+    if info_start is None:
+        xml_start = next((i for i, x in enumerate(table) if re.search(r"^\s*<\?xml", x)), 0)
+    else:
+        xml_start = info_start
+
+    xml_content = "\n".join(table[xml_start:])
+
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError:
+        return pd.DataFrame(
+            columns=[
+                "nameOfIssuer",
+                "titleOfClass",
+                "cusip",
+                "value",
+                "shrsOrPrnAmt",
+                "investmentDiscretion",
+                "votingAuthority",
+                "shares",
+            ]
+        )
+
+    rows = []
+    for node in root.iter():
+        if node.tag.lower().endswith("infotable"):
+            row = {}
+            for child in node.iter():
+                tag = child.tag.split("}")[-1]
+                txt = (child.text or "").strip()
+                if txt:
+                    row[tag] = txt
+            if len(row) > 0:
+                rows.append(row)
+
+    df = pd.DataFrame(rows)
+
+    if len(df) == 0:
+        return pd.DataFrame(
+            columns=[
+                "nameOfIssuer",
+                "titleOfClass",
+                "cusip",
+                "value",
+                "shrsOrPrnAmt",
+                "investmentDiscretion",
+                "votingAuthority",
+                "shares",
+            ]
+        )
+
+    for c in ["cusip", "value", "shrsOrPrnAmt"]:
+        if c not in df.columns:
+            df[c] = None
+
+    df["cusip"] = df["cusip"].astype(str).str.replace(r"[\s-]", "", regex=True)
+    df["value"] = pd.to_numeric(df["value"].astype(str).str.replace(r"\n|\t| ", "", regex=True), errors="coerce")
+
+    shares_temp = df["shrsOrPrnAmt"].astype(str)
+    df["shrsOrPrnAmt"] = np.where(
+        shares_temp.str.contains("SH", case=False, na=False),
+        "SH",
+        np.where(shares_temp.str.contains("PRN", case=False, na=False), "PRN", None),
+    )
+    df["shares"] = pd.to_numeric(
+        shares_temp.str.replace(r"\n|\t|SH|PRN| ", "", regex=True),
+        errors="coerce",
+    )
+
+    for c in ["nameOfIssuer", "titleOfClass", "investmentDiscretion", "votingAuthority"]:
+        if c not in df.columns:
+            df[c] = None
+
+    return df[
+        [
+            "nameOfIssuer",
+            "titleOfClass",
+            "cusip",
+            "value",
+            "shrsOrPrnAmt",
+            "investmentDiscretion",
+            "votingAuthority",
+            "shares",
+        ]
+    ]
+
+
+def gsub_all(pattern: list[str], replacement: list[str], x: str) -> str:
+    if len(pattern) == 0:
+        return x
+
+    out = x
+    for p, r in zip(pattern, replacement):
+        if p == "":
+            continue
+        out = out.replace(p, r)
+
+    return out
+
+
+def parse_one_table(raw_text: str, cusip_list: list[str]) -> pd.DataFrame:
+    table = str(raw_text).split("\n")
+    typ = determine_type(str(raw_text))
+
+    if typ == "none":
+        return pd.DataFrame(
+            columns=[
+                "nameOfIssuer",
+                "titleOfClass",
+                "cusip",
+                "value",
+                "shrsOrPrnAmt",
+                "investmentDiscretion",
+                "votingAuthority",
+                "shares",
+                "table_type",
+            ]
+        )
+
+    if typ == "tab":
+        table = [ln.replace("\t", " ") for ln in table]
+    elif typ == "csv":
+        fixed = []
+        for ln in table:
+            quoted = re.findall(r'(".*?")', ln)
+            quoted_nocomma = [q.replace('"', "").replace(",", "") for q in quoted]
+            fixed_ln = ln
+            for q, qc in zip(quoted, quoted_nocomma):
+                fixed_ln = fixed_ln.replace(q, qc)
+            fixed.append(re.sub(r"\t|,", " ", fixed_ln))
+        table = fixed
+
+    if typ == "xml":
+        out = parse_xml(table, cusip_list)
+    else:
+        out = parse_others(table, cusip_list)
+
+    out = out.copy()
+    out["table_type"] = typ
+
+    keep_cols = [
+        "nameOfIssuer",
+        "titleOfClass",
+        "cusip",
+        "value",
+        "shrsOrPrnAmt",
+        "investmentDiscretion",
+        "votingAuthority",
+        "shares",
+        "table_type",
+    ]
+
+    for c in keep_cols:
+        if c not in out.columns:
+            out[c] = None
+
+    return out[keep_cols]
+
+
+def build_quarter_tables(year_qtr: str) -> None:
+    con = connect_sqlite(year_qtr)
+
+    try:
+        header_table = pd.read_sql_query("SELECT * FROM header_table", con)
+        holdings_table_raw = pd.read_sql_query("SELECT * FROM holdings_table_raw", con)
+
+        if len(holdings_table_raw) == 0:
+            return
+
+        yr = int(str(year_qtr)[:4])
+        use_cusip_join = yr >= 1996
+        cusip_list = get_cusip_vec(con, year_qtr) if use_cusip_join else []
+
+        print(f"Parsing {len(holdings_table_raw)} filings in parallel...")
+
+        with ThreadPoolExecutor(max_workers=min(cfg.workers, 5)) as ex:
+            parsed_list = list(ex.map(lambda x: parse_one_table(x, cusip_list), holdings_table_raw["holding_text"].astype(str).tolist()))
+
+        out_frames = []
+        for fname, p in zip(holdings_table_raw["FILENAME"].tolist(), parsed_list):
+            p = p.copy()
+            p["filename"] = fname
+            out_frames.append(p)
+
+        parsed_q = pd.concat(out_frames, ignore_index=True) if len(out_frames) > 0 else pd.DataFrame()
+
+        hdr = header_table[["FILENAME", "form", "cik", "cikname", "rdate", "fdate"]].rename(columns={"FILENAME": "filename"})
+
+        parsed_q = parsed_q.merge(hdr, on="filename", how="left")
+
+        parsed_q = parsed_q[
+            [
+                "form",
+                "cik",
+                "cikname",
+                "rdate",
+                "fdate",
+                "filename",
+                "nameOfIssuer",
+                "titleOfClass",
+                "cusip",
+                "value",
+                "shrsOrPrnAmt",
+                "investmentDiscretion",
+                "votingAuthority",
+                "shares",
+                "table_type",
+            ]
+        ]
+
+        parsed_q.to_sql("holdings_table_parsed", con, if_exists="replace", index=False)
+    finally:
+        disconnect_sqlite(con)
+```
+
+# 4. Loop over all quarters
+
+```{python}
+for i, yq in enumerate(dates["year_qtr"].tolist(), start=1):
+    print(f"=== Starting quarter {yq} ({i}/{len(dates)}) ===")
+    start_time = time.time()
+
+    build_quarter_tables(yq)
+
+    elapsed = time.time() - start_time
+    print(f"Total time for {yq}: {elapsed / 60:.1f} minutes ({elapsed:.1f} seconds)")
+```
+
+# 5. Parse summary
+
+```{python}
+rows = []
+for i, yq in enumerate(dates["year_qtr"].tolist(), start=1):
+    print(f"\n=== Quarter {i}/{len(dates)}: {yq} ===")
+    con = connect_sqlite(yq)
+
+    try:
+        raw_counts = pd.read_sql_query(
+            "SELECT FILENAME, COUNT(*) AS raw_nrows FROM holdings_table_raw GROUP BY FILENAME",
+            con,
+        )
+        parsed_counts = pd.read_sql_query(
+            "SELECT filename, COUNT(*) AS parsed_nrows FROM holdings_table_parsed GROUP BY filename",
+            con,
+        )
+
+        joined = raw_counts.merge(parsed_counts, how="left", left_on="FILENAME", right_on="filename")
+        joined["parsed_nrows"] = joined["parsed_nrows"].fillna(0)
+
+        rows.append(
+            {
+                "year_qtr": yq,
+                "n_raw_nonzero": int((joined["raw_nrows"] > 0).sum()),
+                "n_parsed_some": int((joined["parsed_nrows"] > 0).sum()),
+            }
+        )
+    finally:
+        disconnect_sqlite(con)
+
+parse_summary = pd.DataFrame(rows)
+parse_summary["year_qtr_num"] = parse_summary["year_qtr"].astype(int)
+parse_summary["pct_parsed_raw"] = parse_summary["n_parsed_some"] / parse_summary["n_raw_nonzero"].clip(lower=1)
+parse_summary["year"] = parse_summary["year_qtr_num"] // 10
+parse_summary["qtr"] = parse_summary["year_qtr_num"] % 10
+
+qtr_map = {1: "02-15", 2: "05-15", 3: "08-15", 4: "11-15"}
+parse_summary["quarter_date"] = pd.to_datetime(
+    parse_summary["year"].astype(str) + "-" + parse_summary["qtr"].map(qtr_map)
+)
+parse_summary = parse_summary.sort_values("quarter_date")
+
+plt.figure(figsize=(8, 4))
+plt.axhline(0.95, linestyle="--", color="grey")
+plt.plot(parse_summary["quarter_date"], parse_summary["pct_parsed_raw"], color="steelblue")
+plt.scatter(parse_summary["quarter_date"], parse_summary["pct_parsed_raw"], s=12, color="steelblue")
+plt.ylim(0, 1)
+plt.title("Parsing success rate over time")
+plt.tight_layout()
+
+parse_summary.to_csv(qa_dir_03 / "parse_summary.csv", index=False)
+plt.savefig(qa_dir_03 / "parse_summary.png", dpi=300)
+plt.close()
+```

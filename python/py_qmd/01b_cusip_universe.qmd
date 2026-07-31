@@ -1,0 +1,395 @@
+---
+title: "01b_cusip_universe"
+author: "Vinci Chan"
+date: today
+format:
+  html:
+    toc: true
+    toc_expand: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+Points to note:
+
+1. Quarters unavailable for download: 1997Q4
+2. 2002Q3 and 2002Q4 has fewer than normal CUSIPS which can affect downstream extraction
+
+# 1. Load Package
+
+```{python}
+import io
+import re
+import sqlite3
+import time
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import requests
+
+from py.config import cfg
+from py.utils_dates import make_quarter_tbl
+from py.utils_db import sqlite_path
+
+# Optional PDF/OCR dependency note:
+# This notebook expects pdfplumber (text extraction) and pytesseract+pdf2image (OCR) for pre-2004.
+# Install if needed:
+# conda install -c conda-forge pdfplumber pdf2image pytesseract poppler tesseract
+import pdfplumber
+from pdf2image import convert_from_path
+import pytesseract
+```
+
+# 2. Setup
+
+```{python}
+dates = make_quarter_tbl(
+    start_year=1996,
+    end_year=cfg.end_year,
+)
+
+qa_dir_01b = cfg.qa_dir / "01b"
+qa_dir_01b.mkdir(parents=True, exist_ok=True)
+```
+
+# 3. Create SEC list pdf urls
+
+```{python}
+input_df = dates.copy()
+
+
+def build_link(row: pd.Series) -> str:
+    year = int(row["year"])
+    qtr = int(row["qtr"])
+
+    if year == 2004 and qtr == 1:
+        return "https://www.sec.gov/divisions/investment/13f-list.pdf"
+
+    if year < 2021:
+        return f"https://www.sec.gov/divisions/investment/13f/13flist{year}q{qtr}.pdf"
+
+    if year == 2021 and qtr <= 2:
+        return f"https://www.sec.gov/divisions/investment/13f/13flist{year}q{qtr}.pdf"
+
+    return f"https://www.sec.gov/files/investment/13flist{year}q{qtr}.pdf"
+
+
+input_df["link"] = input_df.apply(build_link, axis=1)
+```
+
+# 4. Functions
+
+## 4.1 Parse one page of the pdf into a table
+
+```{python}
+def parse_one_page(page_lines: list[str], mode: str = "post") -> pd.DataFrame | None:
+    if not any("CUSIP NO" in line for line in page_lines):
+        return None
+
+    start_idx = next(i for i, line in enumerate(page_lines) if "CUSIP NO" in line)
+    page = page_lines[start_idx:]
+
+    if mode == "post":
+        header = page[0]
+
+        issuer_name_pos = header.find("ISSUER NAME")
+        issuer_desc_pos = header.find("ISSUER DESCRIPTION")
+        status_pos = header.find("STATUS")
+
+        if min(issuer_name_pos, issuer_desc_pos, status_pos) < 0:
+            return None
+
+        max_len = max(len(x) for x in page)
+        seps = [0, issuer_name_pos, issuer_desc_pos, status_pos, max_len]
+
+        rows = []
+        for row in page:
+            padded = row.ljust(max_len)
+            split = [padded[seps[i] : seps[i + 1]].strip() for i in range(len(seps) - 1)]
+            rows.append(split)
+
+        df = pd.DataFrame(rows, columns=["cusip", "issuer_name", "issuer_description", "status"])
+
+    else:
+        max_len = max(len(x) for x in page)
+        rows = []
+        for row in page:
+            padded = row.ljust(max_len)
+            rows.append([padded[0:10].strip(), padded[10:max_len].strip()])
+
+        df = pd.DataFrame(rows, columns=["cusipno", "other"])
+
+    if len(df) <= 2:
+        return None
+
+    return df.iloc[1:].reset_index(drop=True)
+```
+
+## 4.2 Download individual pdfs and parse all pages
+
+```{python}
+def pdf_text_pages(tmp_pdf: Path, pre2004: bool) -> list[str]:
+    if pre2004:
+        images = convert_from_path(tmp_pdf)
+        return [pytesseract.image_to_string(img) for img in images]
+
+    pages = []
+    with pdfplumber.open(tmp_pdf) as pdf:
+        for page in pdf.pages:
+            pages.append(page.extract_text() or "")
+    return pages
+
+
+def download_sec_list(link: str, year: int) -> pd.DataFrame:
+    pre2004 = year < 2004
+    mode = "pre" if pre2004 else "post"
+
+    tmp_pdf = cfg.staging_dir / "tmp_cusip.pdf"
+    cfg.staging_dir.mkdir(parents=True, exist_ok=True)
+
+    ok = False
+    for attempt in range(1, 4):
+        print(f"Attempt {attempt}/3 for {Path(link).name}")
+        try:
+            response = requests.get(
+                link,
+                headers={"User-Agent": cfg.sec_user_agent},
+                timeout=cfg.timeout_sec,
+            )
+            response.raise_for_status()
+            tmp_pdf.write_bytes(response.content)
+            ok = True
+            break
+        except requests.RequestException:
+            print("Download failed, waiting 30s before retry")
+            time.sleep(30)
+
+    if not ok:
+        if tmp_pdf.exists():
+            tmp_pdf.unlink()
+        raise RuntimeError(f"Failed to download PDF after 3 attempts {link}")
+
+    page_text = pdf_text_pages(tmp_pdf, pre2004=pre2004)
+    page_tables = []
+    for page in page_text:
+        tbl = parse_one_page(page.split("\n"), mode=mode)
+        if tbl is not None:
+            page_tables.append(tbl)
+
+    if tmp_pdf.exists():
+        tmp_pdf.unlink()
+
+    if len(page_tables) == 0:
+        return pd.DataFrame()
+
+    return pd.concat(page_tables, ignore_index=True)
+```
+
+## 4.3 Clean table
+
+```{python}
+def clean_cusip_list_post(cusip_df: pd.DataFrame) -> pd.DataFrame:
+    out = cusip_df.copy()
+    out = out.loc[out["cusip"].notna()].copy()
+    out["asterisk"] = out["cusip"].str.contains(r"\*", na=False)
+    out["cusip"] = out["cusip"].str.replace(r"\s|\*", "", regex=True)
+    out["nchar"] = out["cusip"].str.len()
+    out = out.loc[out["nchar"] == 9].drop_duplicates(subset=["cusip"]).reset_index(drop=True)
+    return out
+
+
+def checksum_check(cusips: list[str], return_check: bool = True) -> list[bool] | list[int]:
+    def checksum_value(ch: str, pos: int) -> int:
+        if ch.isdigit():
+            x = int(ch)
+        elif ch.isalpha():
+            x = ord(ch.upper()) - ord("A") + 10
+        else:
+            return 0
+
+        if pos % 2 == 0:
+            x = 2 * x
+
+        return x // 10 + x % 10
+
+    checks = []
+    values = []
+
+    for c in cusips:
+        c = re.sub(r"\s", "", c)
+        chars = list(c)
+
+        if len(chars) < 9:
+            values.append(0)
+            checks.append(False)
+            continue
+
+        total = 0
+        for pos in range(1, 9):
+            total += checksum_value(chars[pos - 1], pos)
+
+        implied = (10 - (total % 10)) % 10
+        values.append(implied)
+        checks.append(chars[8] == str(implied))
+
+    return checks if return_check else values
+
+
+def clean_cusip_list_pre(cusip_df: pd.DataFrame) -> pd.DataFrame:
+    table = cusip_df.copy()
+
+    table = table.loc[
+        table["cusipno"].notna()
+        & table["other"].notna()
+        & (table["cusipno"] != "")
+        & (table["other"] != "")
+    ].copy()
+
+    table = table.loc[~table["cusipno"].str.contains("total", case=False, na=False)].copy()
+
+    cusips = table["cusipno"].str.strip().str.upper().tolist()
+    others = table["other"].str.strip().tolist()
+
+    issues = [
+        r"4%", r"%", r"\.", r"^\|", r"\|", r"8\&$", r"\&", r"J/", r"/ ", r"/",
+        r"\)", r"G@|4@|@", r" 1\] ", r"1\]|\]j|\]", r"¥Y|¥", r"§", r"\?", r"\$", r"}$", r"}",
+    ]
+    replace = ["", "4", "", "", "1", "", "8", "J", "J", "", "J", "4", "11", "1", "Y", "4", "7", "3", "1", ""]
+    errors = [r";", r"'", r"\+", r"°", r"=", r",", r"\(", r"~", r"¢", r"\_", r"\:", r"\#", r"\.", r"-", r"—"]
+
+    for e in errors:
+        cusips = [re.sub(e, "", c) for c in cusips]
+
+    check = checksum_check(cusips, return_check=True)
+
+    for issue, rep in zip(issues, replace):
+        bad_idx = [i for i, ok in enumerate(check) if ok is not True]
+
+        c1 = [re.sub(issue, rep, cusips[i]).strip() for i in bad_idx]
+        c2 = [re.sub(r"[^A-Za-z0-9\s]", "", cusips[i]).strip() for i in bad_idx]
+
+        c1_check = checksum_check(c1, return_check=True)
+        c2_check = checksum_check(c2, return_check=True)
+
+        combined = c1[:]
+        combined_check = c1_check[:]
+
+        for j in range(len(c2)):
+            if c2_check[j] is True:
+                combined[j] = c2[j]
+                combined_check[j] = c2_check[j]
+
+        for k, idx in enumerate(bad_idx):
+            cusips[idx] = combined[k]
+            check[idx] = combined_check[k]
+
+    cusips = [re.sub(r"[^A-Za-z0-9]", "", c) for c in cusips]
+
+    fixed = []
+    for c, o in zip(cusips, others):
+        if len(c) < 9:
+            suffix = re.sub(r"[^A-Za-z0-9]", "", o)[: 9 - len(c)]
+            c = c + suffix
+        elif len(c) > 9:
+            c = c[:9]
+        fixed.append(c)
+
+    out = pd.DataFrame({"cusipno": fixed})
+    out = out.loc[out["cusipno"].str.contains(r"[0-9]", na=False)].copy()
+    out["check"] = checksum_check(out["cusipno"].tolist(), return_check=True)
+    out = out.drop_duplicates(subset=["cusipno"]).reset_index(drop=True)
+
+    return out
+```
+
+# 5. Loop over all quarters in input
+
+```{python}
+for i, row in input_df.iterrows():
+    this_link = row["link"]
+    this_yrqtr = row["year_qtr"]
+    this_yr = int(row["year"])
+    pre2004 = this_yr < 2004
+
+    sqlite_file = sqlite_path(this_yrqtr)
+
+    print(f"Processing {i + 1} of {len(input_df)} year_qtr = {this_yrqtr}")
+
+    start_time = time.time()
+
+    try:
+        cusip_df = download_sec_list(this_link, this_yr)
+    except Exception:
+        print(f"  → FAILED, skipping {this_yrqtr}\n")
+        continue
+
+    con = sqlite3.connect(sqlite_file)
+
+    if pre2004:
+        clean_cusip = clean_cusip_list_pre(cusip_df)
+    else:
+        clean_cusip = clean_cusip_list_post(cusip_df)
+
+    print(f"  → {len(clean_cusip)} unique 13F CUSIPs\n")
+
+    clean_cusip.to_sql("cusip_list", con, if_exists="replace", index=False)
+    con.close()
+
+    elapsed = time.time() - start_time
+    print(f"Total time for {this_yrqtr}: {elapsed / 60:.1f} minutes ({elapsed:.1f} seconds)")
+```
+
+# 6. Output Summary
+
+```{python}
+cusip_summary = pd.DataFrame(
+    {
+        "year_qtr": dates["year_qtr"],
+        "n_cusip": pd.NA,
+    }
+)
+
+for i, yq in enumerate(dates["year_qtr"].tolist()):
+    print(f"\n=== Quarter {i + 1}/{len(dates)}: {yq} ===")
+
+    sqlite_file = sqlite_path(yq)
+
+    if not sqlite_file.exists():
+        print(f"No SQLite file for {yq}; skipping")
+        continue
+
+    con = sqlite3.connect(sqlite_file)
+    try:
+        has_table = con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='cusip_list'"
+        ).fetchone()
+
+        if has_table is None:
+            print(f"No cusip_list table for {yq}; skipping")
+            continue
+
+        n_rows = con.execute("SELECT COUNT(*) FROM cusip_list").fetchone()[0]
+        cusip_summary.loc[i, "n_cusip"] = n_rows
+    finally:
+        con.close()
+
+cusip_summary["year"] = cusip_summary["year_qtr"].str[:4].astype(int)
+cusip_summary["qtr"] = cusip_summary["year_qtr"].str[4].astype(int)
+cusip_summary = cusip_summary.sort_values(["year", "qtr"]).reset_index(drop=True)
+
+x = cusip_summary["year"] + (cusip_summary["qtr"] - 1) / 4
+y = pd.to_numeric(cusip_summary["n_cusip"], errors="coerce")
+
+plt.figure(figsize=(8, 4))
+plt.plot(x, y, color="steelblue")
+plt.scatter(x, y, s=8, color="steelblue")
+plt.title("Number of CUSIPs by Quarter")
+plt.xlabel("Year")
+plt.ylabel("Number of CUSIPs")
+plt.tight_layout()
+plt.savefig(qa_dir_01b / "cusip_summary.png", dpi=300)
+plt.close()
+```
