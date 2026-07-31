@@ -1,0 +1,14 @@
+{
+  "permission": {
+    "edit": {
+      "*.py": "allow",
+      "*.qmd": "allow"
+    },
+    "bash": {
+      "conda install *": "allow"
+    },
+    "executeCode": {
+      "*": "allow"
+    }
+  }
+}
